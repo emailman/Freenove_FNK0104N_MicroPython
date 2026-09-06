@@ -11,6 +11,8 @@ ported from), running on the community
 [lvgl_micropython](https://github.com/lvgl-micropython/lvgl_micropython) project instead of
 stock MicroPython.
 
+![hello_world_display.py running on the board](screenshot.jpg)
+
 ## Hardware
 
 - Board: ESP32-S3-WROOM N8R8 (8MB flash, Octal PSRAM)
@@ -41,6 +43,7 @@ MicroPython too.
 | File | Description |
 |---|---|
 | `hello_world_display.py` | Main display/touch demo. Shows a red-top/blue-bottom split screen; tapping either half toggles it between red and blue. |
+| `screenshot.jpg` | Photo of `hello_world_display.py` running on the board. |
 | `st77922.py` / `_st77922_init.py` | ST77922 QSPI display driver, ported from Freenove's `ST77922.h`/`.cpp`. `_st77922_init.py` holds the panel init command table. |
 | `st77922_touch.py` | I2C driver for the display's integrated touch controller, ported from Freenove's `ST77922_Touch.h`/`.cpp`. |
 | `led_blink.py` | Blinks the plain onboard LED (GPIO 45). No firmware/display dependency. |
