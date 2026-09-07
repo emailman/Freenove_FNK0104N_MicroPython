@@ -101,6 +101,35 @@ If a new `lv.SOMETHING` attribute error comes up, don't guess — grep the WSL
 `lib/micropython/ports/esp32/build-ESP32_GENERIC_S3-SPIRAM_OCT/lv_mp.c` for the exact QSTR
 registration to find where it actually lives.
 
+## Text sizing: no larger fonts compiled in, scale labels instead
+
+This firmware's LVGL binding only has `font_montserrat_12/14/16` compiled in — confirmed by
+grepping the WSL `lvgl_micropython` clone's `lv_mp.c` (same file/technique as the binding
+quirks above) for `font_montserrat_[0-9]*`. Default label text is 14px. There is no larger
+compiled-in font (e.g. `font_montserrat_28`) to switch to, and adding one means enabling
+`LV_FONT_MONTSERRAT_28` in `lv_conf.h` and rebuilding firmware — not a loose-file change.
+
+**To make label text bigger without a firmware rebuild**, apply a render-time scale
+transform to the label instead of changing font:
+
+```python
+label.set_style_transform_pivot_x(lv.pct(50), 0)
+label.set_style_transform_pivot_y(lv.pct(50), 0)
+label.set_style_transform_scale(lv.SCALE_NONE * 2, 0)  # 2x; SCALE_NONE (256) = 1x
+label.center()
+```
+
+The two pivot lines are required, not cosmetic: LVGL's default transform pivot is the
+object's top-left corner (0, 0), so scaling without them grows the label away from wherever
+`.center()` placed it (drifting toward bottom-right) instead of growing in place. Setting the
+pivot to `lv.pct(50)` on both axes anchors the scale to the label's own center, confirmed
+against `lv_obj_pos.c`'s pivot/transform handling (LVGL 9.4).
+
+This upscales the already-rendered 14px glyphs rather than drawing from higher-resolution
+ones, so text reads a bit softer than a native larger font would — acceptable for this
+project's touch-target labels (used in `touch_led_colors.py`), but worth remembering if
+crisper large text is ever needed, which would require the firmware-rebuild route instead.
+
 ## Hardware-state gotcha (not a code bug)
 
 If a script run raises an exception or is interrupted before finishing, **hard-reset the
