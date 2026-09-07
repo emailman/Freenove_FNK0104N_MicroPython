@@ -16,11 +16,12 @@ edge-triggered reads -- like Freenove's own Get_Touch(), this driver just polls 
 touch-info register, which is how LVGL's indev framework drives it anyway.
 
 Register-level behavior below is confirmed against Sitronix's own protocol spec ("Sitronix
-TDDI ST77922 Touch Screen Controller Interface Protocol", v01.00, 2023/07/25 -- ships as
-Datasheet/ST77922_TDDI_Interface_Protocol_V01.00.pdf in this project, pulled from Freenove's
-own GitHub repo's Datasheet/ folder), not just inferred from Freenove's C++ source or
-hardware trial-and-error, though it was independently confirmed on hardware first (raw
-register + INT-pin polling) before this datasheet turned up.
+TDDI ST77922 Touch Screen Controller Interface Protocol", v01.00, 2023/07/25 -- kept locally
+as Datasheet/ST77922_TDDI_Interface_Protocol_V01.00.pdf, pulled from Freenove's own GitHub
+repo's Datasheet/ folder, but NOT committed to this repo -- it's marked confidential, so
+.gitignore excludes that folder), not just inferred from Freenove's C++ source or hardware
+trial-and-error, though it was independently confirmed on hardware first (raw register +
+INT-pin polling) before this datasheet turned up.
 
 IMPORTANT: every poll reads the *entire* `7 * max_points`-byte point-data block starting at
 TOUCH_POINT0, even though only point 0 is used below. Per the spec's Reporting Table section:

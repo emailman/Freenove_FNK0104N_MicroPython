@@ -50,10 +50,14 @@ MicroPython too.
 | `led_blink.py` | Blinks the plain onboard LED (GPIO 45). No firmware/display dependency. |
 | `rgb_led_blink_fnk0104n.py` | Cycles the onboard WS2812 RGB LED (GPIO 40) through red/green/blue. No firmware/display dependency. |
 | `firmware/lvgl_micropy_ESP32_GENERIC_S3-SPIRAM_OCT-8.bin` | The custom-built firmware binary (see below). |
-| `Datasheet/ST77922_TDDI_Interface_Protocol_V01.00.pdf` | Sitronix's own register-level protocol spec for the touch controller (pulled from Freenove's GitHub repo's `Datasheet/` folder). `st77922_touch.py` is verified against this, not just against Freenove's C++ source. |
 
 None of these scripts auto-run on boot — there's no `main.py`/`boot.py`. Run them manually
 from the REPL (`import hello_world_display`, etc.).
+
+`st77922_touch.py` was also verified against Sitronix's own register-level protocol spec for
+the touch controller (pulled from Freenove's GitHub repo's `Datasheet/` folder), kept locally
+as `Datasheet/ST77922_TDDI_Interface_Protocol_V01.00.pdf` but **not committed to this repo**
+— it's marked confidential by Sitronix, so `.gitignore` excludes it.
 
 ## Firmware
 

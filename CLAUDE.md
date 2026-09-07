@@ -76,9 +76,11 @@ coordinate slot** — i.e. the *entire* `7 * max_points`-byte point-data block f
 one point actually used) leaves the chip reporting "touched" forever, even long after the
 finger lifts. This was first found by directly polling raw registers and the INT pin on
 hardware, and is now also confirmed against Sitronix's own protocol spec
-(`Datasheet/ST77922_TDDI_Interface_Protocol_V01.00.pdf`, pulled from Freenove's GitHub repo —
-see its Reporting Table section) — `st77922_touch.py`'s module docstring cites the exact
-wording. `_get_coords()` always reads the full block for this reason.
+(`Datasheet/ST77922_TDDI_Interface_Protocol_V01.00.pdf`, pulled from Freenove's GitHub repo,
+kept locally but **not committed to this repo** — it's marked confidential, so `.gitignore`
+excludes the `Datasheet/` folder — see its Reporting Table section) — `st77922_touch.py`'s
+module docstring cites the exact wording. `_get_coords()` always reads the full block for
+this reason.
 
 That same datasheet documents one more register bit this driver now acts on: `0x0010` bit 7
 is `RstChip` ("notifies host that the touch controller should be reset") — `_get_coords()`

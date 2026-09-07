@@ -1,0 +1,6 @@
+# Confidential vendor datasheet -- kept locally for reference, not committed.
+/Datasheet/
+
+# IDE / tooling
+.idea/
+__pycache__/
