@@ -87,6 +87,91 @@ is `RstChip` ("notifies host that the touch controller should be reset") — `_g
 calls `hw_reset()` when it sees this set, which the original Freenove C++ source doesn't
 handle either.
 
+## `machine.SDCard` has a non-standard, project-specific constructor
+
+Don't trust upstream MicroPython's `machine.SDCard` docs, or the file at
+`lib/micropython/ports/esp32/machine_sdcard.c` in the WSL `lvgl_micropython` clone, for this
+project's firmware — **`lvgl_micropython`'s build overlays its own replacement file,
+`micropy_updates/esp32/machine_sdcard.c`, on top of the upstream one**, and that overlay has a
+different constructor signature. This cost real debugging time (`music_player.py`'s SD/MMC
+mount call, working from the upstream file's kwargs, failed twice with different errors before
+the overlay file turned up — `micropy_updates/` also holds a similarly-overlaid
+`machine_hw_spi.c`, worth checking first for the same reason if `machine.SPI`/`SPI.Bus`
+behavior ever looks off from upstream docs too).
+
+The overlay's SD/MMC-mode (`slot=0/1`) kwargs, confirmed by reading that file directly: `slot`,
+`width`, `clk` (**not** `sck`), `cmd`, `data_pins` (**not** `data`) — all plain ints, with
+`data_pins` a tuple of ints (`mp_obj_get_int()` directly, not `machine_pin_get_id()`, so
+`machine.Pin` objects don't work here — pass raw GPIO numbers). `cd`/`wp` also exist as ints
+(`-1` = unused). SPI mode (`spi_bus=` + `cs=`) takes an already-constructed `SPI.Bus` object
+(this project's own custom SPI class, same one `hello_world_display.py` uses for the display's
+QSPI bus) rather than raw `sck`/`mosi`/`miso` pins like upstream's SPI-mode `machine.SDCard`
+does. `machine.I2C`/`machine.I2S` are **not** overlaid — those remain the unmodified upstream
+implementations (which accept either a `Pin` object or a raw int for pin arguments).
+
+## `machine.I2S` has no MCLK (`mck=`) support on this firmware — and the PWM workaround for it didn't hold up
+
+Confirmed by reading `lib/micropython/ports/esp32/machine_i2s.c` in the WSL `lvgl_micropython`
+clone directly (not overlaid — see above — this is genuinely the file this firmware is built
+from): it only recognizes `sck`/`ws`/`sd`, no `mck`. Easy to get backwards, because MicroPython
+*does* have `mck=` support for `machine.I2S` — just not on the ESP32 port specifically. Other
+ports (rp2, stm32, mimxrt) share a generic `extmod/machine_i2s.c` that has it;
+`mpconfigport.h`'s `MICROPY_PY_MACHINE_I2S_INCLUDEFILE` points the ESP32 port at its own
+`ports/esp32/machine_i2s.c` instead, which predates/lacks that addition.
+
+The first fix tried was generating the ES8311's MCLK in software via `machine.PWM`
+(`freq=sample_rate*256`), matching what the community driver `es8311.py` was ported from does
+on boards with the same limitation. **This did not work reliably on hardware**: real audio
+played for a few seconds, then permanently cut out with zero software-visible error —
+confirmed (by wrapping the WAV player's I2S IRQ callback with a counter) that the SD-card
+reads and I2S non-blocking writes kept running correctly and continuously the entire time, so
+the failure was downstream of all of that, consistent with the codec's PLL briefly locking
+onto the synthesized clock and then losing lock.
+
+**Fix confirmed on hardware (2026-09-08): don't use MCLK at all.** The ES8311 has a documented alternate mode where it
+derives its internal clock from BCLK (the I2S bit clock — a real, ESP32-hardware-generated
+clock, not synthesized) instead of a dedicated MCLK line — register `0x01` bit 7 (`MCLK_SEL`:
+0 = MCLK pin, 1 = BCLK). Confirmed against Espressif's own official driver
+(`espressif/esp-bsp`, `components/es8311/es8311.c`, fetched directly rather than trusting a
+paraphrase) for the exact clock-coefficient math. For this project's fixed case
+(44100Hz/16-bit, what `mp3_to_wav.py` produces), that driver's `coeff_div[]` table turned up a
+convenient fact: BCLK-source mode and the old 256×-ratio MCLK-pin mode need *identical*
+clock-manager register values (0x03–0x08) at 44100Hz — only two registers actually differ:
+`0x01` (`0x3F`→`0xBF`, the mode-select bit above) and `0x02` (`0x00`→`0x18`, a pre-multiplier
+compensating for BCLK being 1/8th the frequency the old table assumed). See `es8311.py` for
+the corrected table and full writeup. This eliminates the PWM/MCLK pin entirely — GPIO17
+(Freenove's documented `I2S_MCK` pin) goes unused by this driver as a result.
+
+One caveat worth remembering if a different sample rate is ever needed: Espressif's
+`coeff_div[]` table only tabulates a handful of specific MCLK/rate pairs, not every possible
+ratio for every rate — BCLK-as-source mode only has a matching table row where `rate × 32`
+happens to be one of those tabulated values (44100Hz's is, luckily). A real multi-rate player
+would need to either look up/recompute the right row per file, or resample everything to
+44100Hz ahead of time (already the plan, via `mp3_to_wav.py`) to sidestep the issue.
+
+Switching to BCLK-as-source made things *worse* at first (total silence, not even the old
+PWM version's brief burst) — because BCLK-as-source means the codec has to lock onto BCLK,
+and `music_player.py`'s `play()` was configuring the codec (`ES8311.power_on()`) **before**
+`WavPlayer.play()` ever created the I2S channel and started BCLK actually toggling. There was
+nothing for the codec to derive a clock from yet. Fixed by reordering `play()`: start I2S
+first (`WavPlayer.play()`), then power on the codec. Obvious in hindsight, but easy to get
+backwards when porting code that assumed an always-present external MCLK, which doesn't have
+this ordering dependency the same way.
+
+With the clock/sequencing fixes above all correctly applied, playback was *still* silent —
+because a separate, unrelated bug was stacked on top of all of it: `music_player.py`'s speaker
+amp enable pin (GPIO1) was being driven the wrong polarity. docs.freenove.com never documented
+which level enables the amp, so it was guessed active-high; on-hardware testing (isolating the
+amp-enable pin with a synthetic tone generated directly over I2S, bypassing SD/WAV entirely,
+so the codec's byte-perfect I2C register writes and healthy I2S pipeline could be trusted and
+GPIO1 treated as the only remaining variable) showed it's actually active-LOW. This alone was
+enough to fully explain an earlier round of "codec config verified byte-perfect, I2S pipeline
+verified healthy, still total silence" debugging that had otherwise pointed toward a downstream
+amp hardware fault — the amp was simply being told to stay off the whole time. Worth
+remembering if silent/no-output symptoms come up again here: don't assume a hardware fault
+before double-checking enable-pin polarity assumptions sourced from docs.freenove.com, since at
+least one of them (this one) was wrong.
+
 ## LVGL Python binding quirks
 
 This binding (generated for this specific firmware build) doesn't always put enums where
