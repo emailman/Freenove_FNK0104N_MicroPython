@@ -1,6 +1,10 @@
 # Confidential vendor datasheet -- kept locally for reference, not committed.
 /Datasheet/
 
+# WiFi credentials for ntp_clock.py -- copy wifi_secrets.py.example to this, fill in real
+# values locally. Never commit real credentials.
+/wifi_secrets.py
+
 # IDE / tooling
 .idea/
 __pycache__/

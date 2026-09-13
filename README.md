@@ -55,13 +55,16 @@ on stock MicroPython too.
 |---|---|
 | `hello_world_display.py` | Main display/touch demo. Shows a red-top/blue-bottom split screen; tapping either half toggles it between red and blue. |
 | `touch_led_colors.py` | Divides the screen into 5 touch areas (red/green/blue/white/black); tapping one sets the onboard RGB LED to that color. |
+| `ntp_clock.py` | WiFi + NTP-synced clock, rendered in landscape via `st77922.ST77922Landscape`. Shows Mountain Time (auto MST/MDT). Needs a real `wifi_secrets.py` (see below). |
+| `wifi_secrets.py.example` | Template for `wifi_secrets.py` (gitignored) -- copy and fill in real WiFi `SSID`/`PASSWORD` before running `ntp_clock.py`. |
 | `music_player.py` | Plays a WAV file from the SD card over the onboard ES8311 codec/speaker; currently plays `demo1.wav` on run. Confirmed working end-to-end on hardware. Starting point for a future full SD-card music player. |
 | `es8311.py` | I2C driver for the ES8311 audio DAC/codec (playback only), ported from raptor09010's `Micropython-ES8311-Library`. |
 | `wavplayer.py` | Non-blocking WAV-over-I2S player, from Mike Teachman's `micropython-i2s-examples` (via the same ES8311 library repo above). |
 | `mp3_to_wav.py` | **PC-side tool**, not a board script. Converts an MP3 to a 16-bit PCM WAV (this firmware has no MP3 decoder) using `miniaudio`; run with the project's `.venv`. |
 | `demo1.mp3` / `demo1.wav` | Sample track. The `.wav` (produced by `mp3_to_wav.py`) is what actually gets copied to the SD card and played. |
 | `screenshot.jpg` | Photo of `hello_world_display.py` running on the board. |
-| `st77922.py` / `_st77922_init.py` | ST77922 QSPI display driver, ported from Freenove's `ST77922.h`/`.cpp`. `_st77922_init.py` holds the panel init command table. |
+| `st77922.py` / `_st77922_init.py` | ST77922 QSPI display driver, ported from Freenove's `ST77922.h`/`.cpp`. `_st77922_init.py` holds the panel init command table. Also has `ST77922Landscape`, a from-scratch software-rotation variant used by `ntp_clock.py` (see its docstring). |
+| `_st77922landscape_init.py` | Thin re-export of `_st77922_init.py`'s init table, required only because `display_driver_framework.DisplayDriver.init()` picks up the init module by class name (`ST77922Landscape` needs its own `_st77922landscape_init` module to be found at all) -- the actual init sequence is identical to `ST77922`'s. |
 | `st77922_touch.py` | I2C driver for the display's integrated touch controller, ported from Freenove's `ST77922_Touch.h`/`.cpp`. |
 | `led_blink.py` | Blinks the plain onboard LED (GPIO 45). No firmware/display dependency. |
 | `rgb_led_blink_fnk0104n.py` | Cycles the onboard WS2812 RGB LED (GPIO 40) through red/green/blue. No firmware/display dependency. |
@@ -105,9 +108,16 @@ frozen framework modules, etc).
   ship one, and this project's build doesn't bundle one). `mp3_to_wav.py` decodes MP3s to WAV
   on the PC instead; real on-device MP3 decoding would need a native C decoder (e.g.
   libhelix-mp3) added to the firmware build.
-- **Landscape/rotation is not implemented.** Freenove's own driver does a manual software
-  pixel-shuffle for rotation 1/3 because hardware MADCTL rotation doesn't behave correctly on
-  this panel; `st77922.py` only implements rotation 0 (native portrait).
+- **Hardware (MADCTL) rotation is not implemented**, and LVGL's own software-rotation path is
+  compiled out of this firmware build (`LV_DRAW_TRANSFORM_USE_MATRIX=0`) -- see
+  `st77922.py`'s `ST77922Landscape` class docstring for how both were ruled out by reading the
+  actual firmware source. `ST77922Landscape` (used by `ntp_clock.py`) instead does its own
+  from-scratch software pixel-shuffle per flush, the same general idea as Freenove's own
+  `Fill_Colors()` workaround but written independently -- **confirmed working correctly on
+  hardware.** Getting there also required working around a real panel limitation (this ST77922
+  cannot handle a narrow-CASET/full-RASET window write at all, regardless of how it's driven)
+  and a large performance fix (a pure-Python per-pixel rotation loop was taking ~8 seconds per
+  chunk); see `CLAUDE.md`'s "Display driver architecture" section for the full writeup.
 - **Multi-touch is not implemented.** The touch controller reports multiple contact points,
   but `st77922_touch.py` only reads and uses the first one (sufficient for single-touch
   tap/click use, which is all `hello_world_display.py` needs).

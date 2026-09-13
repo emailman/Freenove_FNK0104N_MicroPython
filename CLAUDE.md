@@ -55,9 +55,74 @@ required for correctness on real hardware (not stylistic choices):
   `DISPLAY_RENDER_MODE.PARTIAL`, which is why `_set_memory_location` needs to be called fresh
   on every chunk flush rather than once.
 
-Only rotation 0 (native portrait) is implemented. Freenove's own C++ code does a manual
-software pixel-shuffle in `Fill_Colors()` for landscape (rotations 1/3), because hardware
-MADCTL rotation doesn't behave correctly on this panel — that workaround has not been ported.
+Hardware MADCTL rotation doesn't behave correctly on this panel (Freenove's own C++ code works
+around this with a manual software pixel-shuffle in `Fill_Colors()` for landscape, rotations
+1/3). `ST77922Landscape` (used by `ntp_clock.py`) is this project's own from-scratch port of
+that same idea — see the next section for the real hardware issues that surfaced building it
+and how they were fixed.
+
+## Landscape support (`ST77922Landscape`) — a real panel limitation, not a software bug
+
+`ST77922Landscape` presents LVGL a logical 480x320 canvas and remaps every flush by hand onto
+the physical, still-portrait-native 320x480 panel (MADCTL is never touched — see its class
+docstring for why neither hardware rotation nor LVGL's own software-rotation path
+(`LV_DRAW_TRANSFORM_USE_MATRIX=0`) are usable here). Getting this working on real hardware
+took three separate, stacked fixes — worth knowing about before touching this class again:
+
+- **The naive per-chunk rotation loop was catastrophically slow: ~8 seconds per chunk**,
+  measured directly on hardware (not estimated) — a plain-Python loop doing a 2-byte
+  `memoryview` slice-copy per pixel, ~12,480 iterations for one 480x26 chunk. A full-screen
+  redraw (13+ chunks) took well over a minute, and `ntp_clock.py`'s once-a-second refresh timer
+  was re-running that cost every second, forever — also the real explanation for a separately
+  -observed "REPL becomes fully unresponsive" symptom. **Fixed with `@micropython.viper`**
+  (confirmed this firmware build supports both `@micropython.viper` and `@micropython.native`
+  — tested directly on hardware, not assumed): rewriting the same index arithmetic as a
+  `ptr16`-typed pointer-indexing viper function instead of `memoryview` slice objects measured
+  **~2200x faster (3.6ms vs. 8.0s for the same chunk)**, confirmed byte-identical output
+  against the old loop. See `_rotate_chunk_rgb565` in `st77922.py`. (Also confirmed on hardware
+  while chasing this: MicroPython's `array`/`bytearray`/`memoryview` here only support
+  `step=1` slicing — no vectorized strided-copy trick was ever on the table.)
+- **This specific ST77922 panel cannot handle a narrow-CASET/full-RASET window write, under
+  any tested condition** — this is the real explanation for what looked like generic visual
+  "corruption" (green background instead of black, garbled text) for a long stretch of this
+  feature's development. Isolated via a series of throwaway hardware-only diagnostic scripts
+  that stripped away LVGL, rotation math, and Python entirely: a *single*, isolated, all-black
+  narrow-CASET(≤`BUFFER_ROWS`px)/full-RASET(0-479) write — the very first QSPI content write
+  after `display.init()`, nothing sent before it — renders green with random noise instead of
+  black. Repeating it, synchronizing every write so each DMA transfer completes before the
+  next begins, and substituting RAMWR for RAMWRC all made no difference — still green. A
+  full-CASET/narrow-RASET write (portrait mode's shape) of the identical color is always clean.
+  This rules out rotation math, buffer lifetime, timing/races, and command semantics — it's
+  this specific window shape, full stop, that the panel's controller cannot handle, for reasons
+  no amount of software-level testing without a logic analyzer could pin down further.
+  Landscape's row-based LVGL chunking combined with a 90-degree rotation architecturally forces
+  exactly this window shape for any naive per-chunk send (chunked logical rows always span the
+  full logical width, which becomes the full physical Y range after rotation, while the
+  chunked logical dimension becomes the narrow physical X range) — so the fix works around it
+  rather than solving it: `_flush_cb` now blits each chunk's rotated pixels into a persistent,
+  full-panel-sized (320x480x2 byte, PSRAM+DMA) staging framebuffer instead of sending anything
+  to hardware, and only on `flush_is_last()` does it write to the panel for real — by
+  re-slicing the *complete* accumulated image into 40-row, full-CASET/narrow-RASET bands
+  (matching portrait mode's own proven-safe chunk size exactly) and sending those,
+  synchronously. Never send a narrow-CASET/full-RASET window to this panel again.
+- **A stale-text "ghosting" bug**, found only after the two fixes above (a full redraw is fast
+  enough now that this could actually be observed cleanly): `ntp_clock.py`'s per-second
+  `set_text()` on a `transform_scale`-enlarged label only invalidates that label's *current*
+  box, never the union with wherever an earlier, differently-sized/positioned render happened
+  to sit — so a stale fragment of the very first render stayed on screen indefinitely. Likely
+  an LVGL invalidation-vs-`transform_scale` interaction (see "Text sizing" below), not anything
+  in `ST77922Landscape` itself. Fixed pragmatically in `ntp_clock.py` with an unconditional
+  `screen.invalidate()` every tick rather than root-causing the LVGL interaction further —
+  cheap now that a full redraw is ~100ms instead of 60+ seconds.
+
+If any of this needs re-testing: `mpremote connect COM12 ...` (used throughout this project's
+development) only performs a **soft** reset (Python globals wiped, like Ctrl-D) — it does
+*not* free native ESP-IDF resources any more than a script's own soft-reset/re-run does (see
+"Hardware-state gotcha" below), so do an explicit `mpremote connect COM12 reset` + a few
+seconds' settle delay before any test script that constructs `SPI.Bus`/`SPIBus`/a display
+driver from scratch. Also remember the display panel's own GRAM is separate physical memory
+that persists across *any* ESP32 reset — leftover content from a previous script can easily be
+mistaken for a new test's own output unless the new script fills the entire screen itself.
 
 ## Touch driver architecture (`st77922_touch.py`)
 
@@ -217,6 +282,33 @@ ones, so text reads a bit softer than a native larger font would — acceptable 
 project's touch-target labels (used in `touch_led_colors.py`), but worth remembering if
 crisper large text is ever needed, which would require the firmware-rebuild route instead.
 
+**No monospace font is compiled in either** (only proportional `font_montserrat_12/14/16`;
+LVGL ships genuine monospace bitmap fonts — `LV_FONT_UNSCII_8`/`LV_FONT_UNSCII_16` — but both
+are disabled in `lv_conf.h`, so enabling one is a firmware rebuild, same class of change as a
+larger font). This matters for anything that periodically re-renders changing numeric text
+(a clock, a counter): Montserrat-14's glyph advance widths are **not** equal — read directly
+from `lv_font_montserrat_14.c`'s glyph table (its `adv_w` field is 8.4 fixed-point, so real
+pixel width = `adv_w / 16`) — e.g. `'1'` is 5px wide vs. 9px for `'0'`/`'4'`/`'6'`/`'8'`/`'9'`.
+A single auto-fit label re-centers its whole string on every `set_text()`, so digits visibly
+shift horizontally whenever a digit's value changes. Without a firmware rebuild, the fix is a
+**fixed-width character grid**: one `lv.label` per character position, laid out once in a
+fixed-pitch row (each character's own center pinned via `align(lv.ALIGN.CENTER, dx, dy)`,
+never repositioned again — only `set_text()` on each single-character label changes
+thereafter), still using the pivot+scale trick above per character instead of per whole
+string. `ntp_clock.py`'s `_make_char_row`/`_set_row_text` implement this; see there for the
+measured per-glyph cell widths. (`set_style_text_letter_space` was checked and ruled out first
+— confirmed in `lv_mp.c` that it only adds a constant gap on top of each glyph's own advance
+width, which can't produce true monospacing.)
+
+This combination — a `transform_scale`-enlarged label whose *text content* (not its
+transform) changes periodically — also surfaced a separate LVGL invalidation gotcha: a stale
+fragment of an earlier, differently-sized/positioned render can stay on screen indefinitely,
+since `set_text()` only invalidates the label's *current* box, never the union with wherever a
+prior render sat. `ntp_clock.py` works around this with an unconditional `screen.invalidate()`
+every tick rather than relying on any label's own dirty-rect tracking — see the "Landscape
+support" section above for the full story (it was originally mistaken for a display-driver
+bug).
+
 ## Hardware-state gotcha (not a code bug)
 
 If a script run raises an exception or is interrupted before finishing, **hard-reset the
@@ -226,3 +318,13 @@ a soft-reset/re-run (or a REPL Ctrl-D) does not reliably free. An aborted run ca
 of the small internal DMA-capable memory pool allocated that the *next* run's display init
 fails with `ESP_ERR_NO_MEM` (`ValueError: 257`) even though the code itself is correct — this
 has been mistaken for a real regression more than once during this project's development.
+
+**`mpremote connect COM12 ...` only performs this same soft reset**, confirmed directly
+(a variable set in one `mpremote` invocation is gone in the next) — it does not perform a real
+hardware reset either, so it doesn't reliably free these native resources any better than a
+plain re-run would. When driving the board via `mpremote` for iterative testing, do an
+explicit `mpremote connect COM12 reset` (this one does force a real hardware reset) plus a few
+seconds' settle delay before any script that constructs `SPI.Bus`/`SPIBus`/a display driver
+from scratch — otherwise expect confusing failures (e.g. `SPI.Bus()` construction raising a
+plain `TypeError` instead of anything display-related) from the previous run's still-held
+resources, not a real regression in the new code.
