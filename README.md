@@ -55,6 +55,7 @@ on stock MicroPython too.
 |---|---|
 | `hello_world_display.py` | Main display/touch demo. Shows a red-top/blue-bottom split screen; tapping either half toggles it between red and blue. |
 | `touch_led_colors.py` | Divides the screen into 5 touch areas (red/green/blue/white/black); tapping one sets the onboard RGB LED to that color. |
+| `touch_keyboard_demo.py` | On-screen touch keyboard (LVGL's built-in `lv.keyboard`/`lv.textarea`) in portrait. Confirms both widgets are compiled into this firmware; landscape touch is not yet attempted (see its docstring). |
 | `ntp_clock.py` | WiFi + NTP-synced clock, rendered in landscape via `st77922.ST77922Landscape`. Shows Mountain Time (auto MST/MDT). Needs a real `wifi_secrets.py` (see below). |
 | `wifi_secrets.py.example` | Template for `wifi_secrets.py` (gitignored) -- copy and fill in real WiFi `SSID`/`PASSWORD` before running `ntp_clock.py`. |
 | `music_player.py` | Plays a WAV file from the SD card over the onboard ES8311 codec/speaker; currently plays `demo1.wav` on run. Confirmed working end-to-end on hardware. Starting point for a future full SD-card music player. |
