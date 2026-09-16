@@ -19,10 +19,9 @@ Requires the custom lvgl_micropython firmware -- see hello_world_display.py / RE
 Wiring/init pattern (QSPI display bus, then I2C touch after it) is copied from
 hello_world_display.py; see that file's comments for why the ordering matters.
 
-Portrait only. Landscape touch is a separate, not-yet-attempted piece of work -- see
-CLAUDE.md/the plan this was built from for why (st77922_touch.py's raw coordinates have no
-rotation remapping, and no script in this repo has ever combined touch with
-st77922.ST77922Landscape).
+Portrait only -- see touch_keyboard_demo_landscape.py for the landscape version, which pairs
+st77922.ST77922Landscape with st77922_touch.ST77922TouchLandscape (a touch coordinate
+remapping this driver's raw output otherwise doesn't have).
 """
 
 import gc

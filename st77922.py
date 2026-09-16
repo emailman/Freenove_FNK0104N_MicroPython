@@ -249,19 +249,38 @@ class ST77922(display_driver_framework.DisplayDriver):
 #
 # Writes directly into the right place inside ST77922Landscape's persistent, full-panel-sized
 # staging framebuffer (see that class's docstring) rather than into a small per-chunk buffer --
-# `fb_width` is that staging buffer's row stride (320, the panel's native width) and `px1` is
-# this chunk's physical column offset within it, so the destination is strided differently than
-# the source (dest rows are fb_width pixels apart, source rows are h_l apart) -- an ordinary
-# blit, not a same-shape copy.
+# `fb_width`/`fb_height` are that staging buffer's physical dimensions (320x480), so the
+# destination is strided differently than the source (dest rows are fb_width pixels apart,
+# source rows are w_l apart) -- an ordinary blit, not a same-shape copy.
+#
+# General form: handles a chunk starting at ANY logical (lx1, ly1), not just lx1 == 0. Applies
+# the class docstring's px = ly, py = (fb_height - 1) - lx mapping directly, per source pixel
+# (r, c) at logical (lx1 + c, ly1 + r) -> physical (px, py) = (ly1 + r, fb_height - 1 - lx1 - c).
+# An earlier version hard-assumed every chunk spans the full logical width (lx1 always 0, w_l
+# always the full canvas width) -- true for ntp_clock.py's forced-every-tick full-screen
+# invalidate, but NOT true for arbitrary widgets' own partial invalidates (confirmed on
+# hardware while building touch_keyboard_demo_landscape.py, chasing a brief solid-green flash
+# on the textarea/keyboard when a widget triggers its own partial redraw (typing, the
+# textarea's blinking cursor, a keyboard mode-switch button). Direct hardware instrumentation
+# (logging every _flush_cb call's area, and separately sampling raw pre-rotation pixel data)
+# ruled out both this function's old lx1 == 0-only assumption and outright bad source pixel
+# data as the cause -- every observed chunk in that app was already full logical width
+# (lx1 == 0), and sampled colors always looked like ordinary UI content, never green. The flash
+# itself was never fully root-caused (see touch_keyboard_demo_landscape.py's docstring for what
+# was ruled out and where that investigation was left). This generalization is kept anyway
+# because it's strictly more correct than the old lx1 == 0-only version for any chunk that
+# *does* start at a nonzero logical x (verified byte-identical to the old code's output for the
+# lx1 == 0, full-width case ntp_clock.py exercises every tick -- no regression there), even
+# though it turned out not to explain the flash above.
 @micropython.viper
-def _rotate_chunk_rgb565(src, fb, w_l: int, h_l: int, px1: int, fb_width: int):
+def _rotate_chunk_rgb565(src, fb, w_l: int, h_l: int, lx1: int, ly1: int, fb_width: int, fb_height: int):
     s = ptr16(src)
     o = ptr16(fb)
-    for prow in range(w_l):
-        col_src = w_l - 1 - prow
-        dest_row = prow * fb_width + px1
-        for pcol in range(h_l):
-            o[dest_row + pcol] = s[pcol * w_l + col_src]
+    for c in range(w_l):
+        py = fb_height - 1 - lx1 - c
+        dest_row = py * fb_width
+        for r in range(h_l):
+            o[dest_row + ly1 + r] = s[r * w_l + c]
 
 
 class ST77922Landscape(ST77922):
@@ -350,19 +369,6 @@ class ST77922Landscape(ST77922):
         w_l = lx2 - lx1 + 1  # logical chunk width (columns)
         h_l = ly2 - ly1 + 1  # logical chunk height (rows)
 
-        # Physical (native 320x480) starting column this logical area rotates onto: px1 = ly1,
-        # from the general px = ly, py = (_PHYSICAL_HEIGHT - 1) - lx corner mapping. Only px1 is
-        # needed here -- no physical window is set or sent to the panel in this method at all
-        # any more (see the class docstring for why); the row placement within the staging
-        # framebuffer is handled by _rotate_chunk_rgb565's fb_width parameter below instead.
-        # This starting column is always within a narrow (up to BUFFER_ROWS wide) range -- an
-        # inherent consequence of LVGL only ever chunking a partial-render buffer by logical
-        # ROWS combined with a 90-degree rotation: logical rows always span the full logical
-        # width (lx always 0..479 in one flush), and after rotation that becomes the full
-        # physical row range, while the chunked logical dimension (ly) becomes the narrow
-        # physical column range.
-        px1 = ly1
-
         px_size = lv.color_format_get_size(self._color_space)  # NOQA -- 2 for RGB565
         size = w_l * h_l * px_size
         src = color_p.__dereference__(size)  # NOQA
@@ -370,20 +376,30 @@ class ST77922Landscape(ST77922):
         # Blit this chunk's rotated pixels directly into the persistent staging framebuffer at
         # its physical position -- see _rotate_chunk_rgb565's comment and __init__ above. No
         # window is set and nothing is sent to the panel here; that only happens once per
-        # redraw, below, on the last chunk.
+        # redraw, below, on the last chunk. _rotate_chunk_rgb565 handles an arbitrary (lx1, ly1)
+        # chunk origin directly, not just the lx1 == 0, full-logical-width case a naive
+        # per-chunk rotation is usually forced into by row-based partial-buffer chunking of a
+        # *full-screen* invalidate -- see that function's comment for why this generalization
+        # is correct but turned out not to be what a separately-observed corruption traced back
+        # to (see touch_keyboard_demo_landscape.py's docstring).
         if px_size == 2:
-            _rotate_chunk_rgb565(src, self._landscape_fb, w_l, h_l, px1, self._PHYSICAL_WIDTH)
+            _rotate_chunk_rgb565(
+                src, self._landscape_fb, w_l, h_l, lx1, ly1,
+                self._PHYSICAL_WIDTH, self._PHYSICAL_HEIGHT
+            )
         else:
             # Never exercised in practice (every script here uses RGB565) -- kept only so a
             # future non-RGB565 use doesn't hit a hard type error in _rotate_chunk_rgb565's
-            # ptr16 cast. Slower (plain Python), and still correct.
+            # ptr16 cast. Slower (plain Python), and still correct -- same general (lx1, ly1)
+            # -aware mapping as the viper version above.
             fb = memoryview(self._landscape_fb)
-            for prow in range(w_l):
-                col_src = (w_l - 1 - prow) * px_size
-                dest_row = (prow * self._PHYSICAL_WIDTH + px1) * px_size
-                for pcol in range(h_l):
-                    src_off = pcol * w_l * px_size + col_src
-                    dest_off = dest_row + pcol * px_size
+            for c in range(w_l):
+                py = self._PHYSICAL_HEIGHT - 1 - lx1 - c
+                dest_row = (py * self._PHYSICAL_WIDTH) * px_size
+                col_src = c * px_size
+                for r in range(h_l):
+                    src_off = r * w_l * px_size + col_src
+                    dest_off = dest_row + (ly1 + r) * px_size
                     fb[dest_off:dest_off + px_size] = src[src_off:src_off + px_size]
 
         if not self._disp_drv.flush_is_last():

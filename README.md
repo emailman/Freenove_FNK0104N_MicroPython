@@ -55,7 +55,8 @@ on stock MicroPython too.
 |---|---|
 | `hello_world_display.py` | Main display/touch demo. Shows a red-top/blue-bottom split screen; tapping either half toggles it between red and blue. |
 | `touch_led_colors.py` | Divides the screen into 5 touch areas (red/green/blue/white/black); tapping one sets the onboard RGB LED to that color. |
-| `touch_keyboard_demo.py` | On-screen touch keyboard (LVGL's built-in `lv.keyboard`/`lv.textarea`) in portrait. Confirms both widgets are compiled into this firmware; landscape touch is not yet attempted (see its docstring). |
+| `touch_keyboard_demo.py` | On-screen touch keyboard (LVGL's built-in `lv.keyboard`/`lv.textarea`) in portrait. Confirms both widgets are compiled into this firmware. |
+| `touch_keyboard_demo_landscape.py` | Landscape version of `touch_keyboard_demo.py`, pairing `st77922.ST77922Landscape` with `st77922_touch.ST77922LTouch` (remaps raw physical touch coordinates into the landscape logical canvas). Known cosmetic issue: some keyboard control buttons (Enter, mode-switch, sometimes Backspace) briefly flash solid green -- see its docstring. |
 | `ntp_clock.py` | WiFi + NTP-synced clock, rendered in landscape via `st77922.ST77922Landscape`. Shows Mountain Time (auto MST/MDT). Needs a real `wifi_secrets.py` (see below). |
 | `wifi_secrets.py.example` | Template for `wifi_secrets.py` (gitignored) -- copy and fill in real WiFi `SSID`/`PASSWORD` before running `ntp_clock.py`. |
 | `music_player.py` | Plays a WAV file from the SD card over the onboard ES8311 codec/speaker; currently plays `demo1.wav` on run. Confirmed working end-to-end on hardware. Starting point for a future full SD-card music player. |
@@ -66,7 +67,7 @@ on stock MicroPython too.
 | `screenshot.jpg` | Photo of `hello_world_display.py` running on the board. |
 | `st77922.py` / `_st77922_init.py` | ST77922 QSPI display driver, ported from Freenove's `ST77922.h`/`.cpp`. `_st77922_init.py` holds the panel init command table. Also has `ST77922Landscape`, a from-scratch software-rotation variant used by `ntp_clock.py` (see its docstring). |
 | `_st77922landscape_init.py` | Thin re-export of `_st77922_init.py`'s init table, required only because `display_driver_framework.DisplayDriver.init()` picks up the init module by class name (`ST77922Landscape` needs its own `_st77922landscape_init` module to be found at all) -- the actual init sequence is identical to `ST77922`'s. |
-| `st77922_touch.py` | I2C driver for the display's integrated touch controller, ported from Freenove's `ST77922_Touch.h`/`.cpp`. |
+| `st77922_touch.py` | I2C driver for the display's integrated touch controller, ported from Freenove's `ST77922_Touch.h`/`.cpp`. Also has `ST77922LTouch`, which remaps raw touch coordinates for use with `st77922.ST77922Landscape` (used by `touch_keyboard_demo_landscape.py`). |
 | `led_blink.py` | Blinks the plain onboard LED (GPIO 45). No firmware/display dependency. |
 | `rgb_led_blink_fnk0104n.py` | Cycles the onboard WS2812 RGB LED (GPIO 40) through red/green/blue. No firmware/display dependency. |
 | `firmware/lvgl_micropy_ESP32_GENERIC_S3-SPIRAM_OCT-8.bin` | The custom-built firmware binary (see below). |
