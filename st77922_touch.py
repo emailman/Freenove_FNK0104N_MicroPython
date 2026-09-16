@@ -147,3 +147,45 @@ class ST77922Touch(pointer_framework.PointerDriver):
         y = ((data[2] & 0x3F) << 8) | data[3]
 
         return self.PRESSED, x, y
+
+
+class ST77922LTouch(ST77922Touch):
+    """Touch variant for use alongside st77922.ST77922Landscape, which presents LVGL a
+    logical 480x320 canvas over the physically portrait (320x480) panel -- see that class's
+    docstring in st77922.py for the full rotation story. The touch controller has no rotation
+    concept of its own: ST77922Touch._get_coords() always reports raw coordinates in the
+    panel's native physical orientation (0..319 x, 0..479 y) regardless of what LVGL display
+    rotation is active, confirmed by touch_led_colors.py/touch_keyboard_demo.py working
+    correctly against a native-orientation 320x480 display, where physical == logical 1:1.
+
+    ST77922Landscape._flush_cb documents its physical-from-logical mapping as
+    physical (px, py) = (ly, _PHYSICAL_HEIGHT - 1 - lx). Inverting that for touch input
+    (physical -> logical) gives logical (lx, ly) = (_PHYSICAL_HEIGHT - 1 - py, px) -- exactly
+    what _get_coords() below applies to the raw coordinates from the base class.
+
+    Named "...LTouch", not the more obvious "...TouchLandscape", for a real hardware reason
+    found while testing this on the board: pointer_framework.PointerDriver's base __init__
+    (via touch_cal_data.py) stores calibration data in ESP-IDF NVS keyed by (something derived
+    from) the driver's class name, and NVS keys are capped at 15 characters --
+    "ST77922TouchLandscape" (22 chars) fails construction with
+    `OSError: (-4361, 'ESP_ERR_NVS_KEY_TOO_LONG')` before any calibration or touch logic even
+    runs. Confirmed directly on hardware by bisecting class-name length with a throwaway
+    subclass: **with no display constructed yet, names up to 15 chars succeed; once a real
+    display is registered first (the actual order every script here uses), the same test
+    tops out at 13 chars** -- registering a display appears to add ~2 characters to whatever
+    touch_cal_data derives its key from. "ST77922LTouch" is exactly 13 chars, the confirmed
+    safe boundary under real usage conditions -- do not lengthen this name without re-running
+    that bisection with a display active first.
+    """
+
+    # Kept as a local literal (not imported from st77922.py) to avoid a display-driver
+    # dependency in this touch-only module; matches st77922.ST77922Landscape._PHYSICAL_HEIGHT,
+    # which won't change for this board's fixed 320x480 panel.
+    _PHYSICAL_HEIGHT = 480
+
+    def _get_coords(self):
+        result = super()._get_coords()
+        if result is None:
+            return None
+        state, px, py = result
+        return state, self._PHYSICAL_HEIGHT - 1 - py, px
