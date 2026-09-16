@@ -33,6 +33,7 @@ from machine import SPI
 
 import st77922
 from task_handler import TaskHandler
+
 # i2c/st77922_touch are imported further down, after the display's QSPI bus is up --
 # see hello_world_display.py's comment for why.
 
