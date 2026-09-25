@@ -237,6 +237,49 @@ remembering if silent/no-output symptoms come up again here: don't assume a hard
 before double-checking enable-pin polarity assumptions sourced from docs.freenove.com, since at
 least one of them (this one) was wrong.
 
+## Combining audio with the display/touch stack (`voice_recorder.py`)
+
+`voice_recorder.py` is the first script to run audio and LVGL/touch in one process. These
+things surfaced on hardware that apply to any future combined script (e.g. a music player UI):
+
+- **One I2C host 0 for both codec and touch.** They share pins 39/38, and host 0 can't be
+  opened twice. Pass the touch driver's `i2c.I2C.Bus` straight to `ES8311(...)` — it wraps
+  `machine.I2C` and has the same `writeto_mem()` the codec driver uses.
+- **Non-blocking I2S callbacks get silently dropped.** `machine.I2S` IRQ callbacks go through
+  `micropython.schedule()`, whose queue is shared with LVGL's task handler and touch polling.
+  When it's full, the completion callback is lost and the transfer chain just stops — no
+  exception (playback stuck at position 0). `voice_recorder.py` needed 5 watchdog restarts
+  across a handful of touch-driven record/play runs, so this is common, not a rare edge case.
+  Its fix: the 100ms LVGL UI timer re-invokes the callback if audio has made no progress for
+  500ms. Also keep LVGL redraws small (no full-screen `invalidate()` every tick) and I2S
+  buffers generous (`ibuf=40000`). Before either of those, a 10s recording took ~40s.
+- **Touch polling puts clicks into the mic.** Every LVGL touch read is I2C traffic on the bus
+  shared with the codec, and it couples into the mic input. Measured on a silent recording: a
+  ~0.5ms click every ~33ms (the indev read period), peaking ~750 raw — only ~9dB below
+  speech, so no noise gate can separate them, and heard as "static" after normalization.
+  With `touch._indev_drv.enable(False)` for the duration of the recording: zero clicks, peak
+  162. `voice_recorder.py` pauses touch while recording for this reason.
+- **Mic path:** `ES8311.enable_mic()`. Note that `_POWER_UP`'s `0x0A=0x4C` mutes the ADC's
+  serial output (bit 6) — fine for playback, and `enable_mic()` clears it. Raw speech at
+  36dB mic gain only peaks at ~2400/32767, so recordings are normalized in software (viper)
+  instead of adding more analog gain.
+- **Post-processing chain** (`_process()`, run once after each recording): one-pole 100Hz
+  high-pass + Butterworth 4kHz low-pass biquad, then a 10ms-window noise gate (-12dB floor,
+  200ms hold, one window of look-ahead, linear gain ramps), then normalization. It's all
+  integer math in `@micropython.viper` (the filter in Q13/Q15 fixed point) — the full
+  441k-sample pass takes ~1s. Two things to know if you edit it: viper functions take at most
+  4 arguments, which is why coefficients are passed as an `array("i")`; and the gate
+  threshold (200 raw) was calibrated against a silent, filtered recording whose 10ms window
+  peaks never exceeded 98. Re-measure if `MIC_GAIN` or the filter cutoffs change. Once touch
+  polling was paused, the gate helped; before that it couldn't have, as explained above.
+- **Processing and saving are deferred to the LVGL timer.** `_rx_cb` only sets a
+  `PROCESSING` state. The UI timer runs `_process()` on the tick *after* "Processing..." has
+  been drawn, then does the same for `SAVING` / `_save()`. Each step blocks for ~1s (processing)
+  or ~2.6s (the SD write of 882KB). Running them directly in the I2S callback would freeze the
+  UI with a stale status line. The SD card is mounted with the same `machine.SDCard` call as
+  `music_player.py` (see the SDCard section above), after display init, and it coexists with
+  the QSPI display and I2S without problems.
+
 ## LVGL Python binding quirks
 
 This binding (generated for this specific firmware build) doesn't always put enums where

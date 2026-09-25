@@ -30,6 +30,7 @@ stock MicroPython.
 | Touch (I2C, addr `0x55`, 16-bit register addresses) | `SCL=39 SDA=38 RST=48 INT=47` |
 | SD card (SDMMC, 4-bit)* | `CLK=5 CMD=4 D0=6 D1=7 D2=2 D3=3` |
 | Audio: I2S to ES8311 DIN* | `BCK=18 WS=21 SD=15` (MCK=17 exists but is unused -- see `es8311.py`) |
+| Audio: I2S from ES8311 ADC (onboard MEMS mic)* | `DIN=16` (shares BCK/WS above; used by `voice_recorder.py`) |
 | Audio: ES8311 control (I2C, addr `0x18`)* | `SCL=39 SDA=38` (shares the touch controller's bus) |
 | Audio: speaker amp enable* | `GPIO 1` (active-LOW -- confirmed on hardware; docs.freenove.com didn't document polarity) |
 | Onboard RGB LED (WS2812) | `GPIO 40` |
@@ -60,7 +61,8 @@ on stock MicroPython too.
 | `ntp_clock.py` | WiFi + NTP-synced clock, rendered in landscape via `st77922.ST77922Landscape`. Shows Mountain Time (auto MST/MDT). Needs a real `wifi_secrets.py` (see below). |
 | `wifi_secrets.py.example` | Template for `wifi_secrets.py` (gitignored) -- copy and fill in real WiFi `SSID`/`PASSWORD` before running `ntp_clock.py`. |
 | `music_player.py` | Plays a WAV file from the SD card over the onboard ES8311 codec/speaker; currently plays `demo1.wav` on run. Confirmed working end-to-end on hardware. Starting point for a future full SD-card music player. |
-| `es8311.py` | I2C driver for the ES8311 audio DAC/codec (playback only), ported from raptor09010's `Micropython-ES8311-Library`. |
+| `voice_recorder.py` | Touchscreen voice recorder (portrait): RECORD captures 10s from the onboard mic into RAM, PLAY plays it back over the speaker. Each recording is cleaned up in software (100Hz-4kHz band-pass, noise gate, normalization) before playback, then saved to the SD card as the next free `recNNN.wav` (skipped if no card is inserted). Confirmed working on hardware. |
+| `es8311.py` | I2C driver for the ES8311 audio codec, ported from raptor09010's `Micropython-ES8311-Library`. Playback, plus mic/ADC input via `enable_mic()`. |
 | `wavplayer.py` | Non-blocking WAV-over-I2S player, from Mike Teachman's `micropython-i2s-examples` (via the same ES8311 library repo above). |
 | `mp3_to_wav.py` | **PC-side tool**, not a board script. Converts an MP3 to a 16-bit PCM WAV (this firmware has no MP3 decoder) using `miniaudio`; run with the project's `.venv`. |
 | `demo1.mp3` / `demo1.wav` | Sample track. The `.wav` (produced by `mp3_to_wav.py`) is what actually gets copied to the SD card and played. |
