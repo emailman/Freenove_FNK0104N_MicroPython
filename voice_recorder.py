@@ -1,7 +1,8 @@
 """
 Voice recorder demo for the Freenove FNK0104N: tap RECORD to capture 10 seconds from the
-onboard MEMS mic, then tap PLAY to hear it back over the onboard speaker. Portrait UI on the
-3.5" display (ST77922, 320x480, QSPI) with its integrated touch.
+onboard MEMS mic, then tap PLAY to pick any .wav file in the SD card's root from a scrollable
+list and hear it over the onboard speaker. Portrait UI on the 3.5" display (ST77922, 320x480,
+QSPI) with its integrated touch.
 
 Audio goes through the same ES8311 codec music_player.py uses (see its docstring for wiring,
 and es8311.py for the codec config -- enable_mic() is what turns on the ADC/mic path). The mic
@@ -14,7 +15,7 @@ re-initialized *after* BCLK is running, the same ordering music_player.play() fo
 
 Recording is 44100Hz/16-bit mono, the one rate es8311.py's BCLK-clock table is verified for
 (ESP32 std-mode I2S still clocks two slots in MONO, so BCLK is identical to stereo playback).
-10s of that is 882,000 bytes, held in a RAM (PSRAM heap) bytearray -- no SD card needed.
+10s of that is 882,000 bytes, recorded into a RAM (PSRAM heap) bytearray.
 
 The codec's I2C control port (addr 0x18) shares host 0 / pins 39/38 with the touch controller
 (addr 0x55), and host 0 can't be opened twice in one process, so the codec is driven through
@@ -30,10 +31,17 @@ After each recording, the audio is post-processed once (~1s, "Processing..." on 
 normalization so the loudest sample is near full scale. See _process() and the constants
 above it for the measured values each setting was calibrated against.
 
-The processed recording is then saved to the SD card as the next free /sd/recNNN.wav
-(rec001.wav, rec002.wav, ... -- never overwritten; ~2.6s, "Saving..." on screen), in the same
-44100Hz/16-bit format music_player.py plays. It's also kept in RAM for PLAY. With no SD card
-inserted, saving is skipped and everything else works the same.
+The processed recording is then saved to the SD card as /sd/rec_YYYYMMDD_HHMMSS.wav (Mountain
+local time; ~2.6s, "Saving..." on screen), in the same 44100Hz/16-bit format music_player.py
+plays. The clock comes from one WiFi+NTP sync at startup (local_time.py, credentials from
+wifi_secrets.py), after which WiFi is turned off again. If that sync fails, files fall back to
+the next free recNNN.wav name instead. Nothing is ever overwritten.
+
+PLAY opens a file picker that lists the SD card's root .wav files, newest recordings first.
+Tapping one streams it from the card (so songs far bigger than RAM play fine); only
+44100Hz/16-bit PCM files are accepted, mono or stereo -- the one rate es8311.py's clock table
+supports. With no SD card inserted, saving is skipped and PLAY replays the last recording from
+RAM instead.
 
 Confirmed working on hardware (2026-09-25): voice is clear, playback volume is comfortable, and
 touch works normally after each recording.
@@ -144,10 +152,19 @@ _recorded_len = 0
 _nflush = 0
 _i2s = None
 
-# --- SD card: each processed recording is saved as /sd/recNNN.wav ---------------------------
+# Playback source: an open WAV file on the SD card (or _RamSource for the in-RAM recording),
+# streamed CHUNK bytes at a time through _play_buf by _tx_cb.
+_play_src = None
+_play_len = 0  # bytes of sample data
+_play_rate = RATE * 2  # bytes/second, for the countdown
+_play_name = ""
+_play_buf = bytearray(CHUNK)
+_play_mv = memoryview(_play_buf)
+
+# --- SD card: each processed recording is saved as /sd/rec_YYYYMMDD_HHMMSS.wav --------------
 # Same SDMMC wiring and non-standard machine.SDCard kwargs as music_player.py (see its
-# docstring / CLAUDE.md). 44100Hz/16-bit mono, so music_player.play("recNNN.wav") can play them
-# back too. If no card is present, saving is just skipped -- the recorder still works.
+# docstring / CLAUDE.md). 44100Hz/16-bit mono, so music_player.play() can play them back too.
+# If no card is present, saving is just skipped -- the recorder still works.
 import os
 import struct
 
@@ -171,9 +188,53 @@ def _mount_sd():
 
 _sd_ok = _mount_sd()
 _last_saved = None
+_unsaved = False  # last recording exists only in RAM (save failed / not yet saved)
+
+
+def _sync_clock():
+    """One WiFi+NTP sync for the filename timestamps, then WiFi off again.
+
+    The disconnect() before active(False) is required, not tidiness. Measured on hardware
+    (2026-09-26): after a connect + active(False) alone, the mic recorded only its noise floor
+    (100ms-window peaks median 91, max 166 while talking), while playback still worked. With
+    disconnect() first, recordings were normal (median 363, max 1742, matching a run with no
+    WiFi at all). Any failure (no wifi_secrets.py, no network, NTP timeout) just means
+    recordings fall back to recNNN.wav names.
+    """
+    wlan = None
+    try:
+        import local_time
+        wlan = local_time.connect_wifi()
+        return local_time.sync_time()
+    except Exception as e:  # NOQA -- ImportError, RuntimeError (timeout), OSError, ...
+        print("Clock sync failed -- recordings will be named recNNN.wav:", e)
+        return False
+    finally:
+        if wlan is None:
+            import network
+            wlan = network.WLAN(network.STA_IF)
+        try:
+            wlan.disconnect()
+        except OSError:
+            pass  # wasn't connected
+        time.sleep_ms(200)
+        wlan.active(False)
+
+
+_clock_ok = _sd_ok and _sync_clock()
 
 
 def _next_filename():
+    if _clock_ok:
+        import local_time
+        t = local_time.mountain_time()[0]
+        base = "rec_%04d%02d%02d_%02d%02d%02d" % t[:6]
+        names = os.listdir(SD_MOUNT)
+        name, n = base + ".wav", 2
+        while name in names:  # two saves within the same second
+            name = "%s_%d.wav" % (base, n)
+            n += 1
+        return name
     used = set()
     for name in os.listdir(SD_MOUNT):
         if name.startswith("rec") and name.endswith(".wav") and name[3:-4].isdigit():
@@ -194,21 +255,97 @@ def _wav_header(data_len):
 
 
 def _save():
-    global _last_saved
+    global _last_saved, _unsaved
     name = _next_filename()
-    with open(SD_MOUNT + "/" + name, "wb") as f:
+    path = SD_MOUNT + "/" + name
+    with open(path, "wb") as f:
         f.write(_wav_header(_recorded_len))
         f.write(_audio_mv[:_recorded_len])
+    # Seen on hardware (2026-09-26): a card whose writes had started failing still returned
+    # full byte counts from write() and raised nothing on close, leaving 0-byte files behind.
+    # Check the size that actually landed on the card instead of trusting write().
+    size = os.stat(path)[6]
+    if size != 44 + _recorded_len:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise OSError("wrote %d of %d bytes" % (size, 44 + _recorded_len))
     _last_saved = name
+    _unsaved = False
     print("Saved", SD_MOUNT + "/" + name)
 
 
-def _start_i2s(mode, sd_pin):
+def _list_wavs():
+    """Root .wav files on the SD card, reverse-sorted so the newest rec_YYYYMMDD_* is first."""
+    return sorted((n for n in os.listdir(SD_MOUNT) if n.lower().endswith(".wav")), reverse=True)
+
+
+def _open_wav(name):
+    """Opens /sd/<name> positioned at its sample data; returns (file, channels, data_len).
+
+    Walks the RIFF chunks (skipping LIST/etc. that converters add) rather than assuming a
+    44-byte header. Raises ValueError with a short, on-screen-sized message for anything that
+    isn't 44100Hz/16-bit PCM -- the only format es8311.py's BCLK clock table supports.
+    """
+    f = open(SD_MOUNT + "/" + name, "rb")
+    try:
+        riff = f.read(12)
+        if len(riff) < 12 or riff[:4] != b"RIFF" or riff[8:] != b"WAVE":
+            raise ValueError("Not a WAV file")
+        channels = None
+        while True:
+            hdr = f.read(8)
+            if len(hdr) < 8:
+                raise ValueError("No audio data")
+            cid, size = hdr[:4], struct.unpack("<I", hdr[4:])[0]
+            if cid == b"fmt ":
+                fmt = f.read(size + (size & 1))
+                audio_fmt, channels, rate = struct.unpack("<HHI", fmt[:8])
+                bits = struct.unpack("<H", fmt[14:16])[0]
+                if audio_fmt != 1 or bits != 16:
+                    raise ValueError("Unsupported format")
+                if rate != RATE:
+                    raise ValueError("Unsupported: %dHz" % rate)
+                if channels not in (1, 2):
+                    raise ValueError("Unsupported format")
+            elif cid == b"data":
+                if channels is None:
+                    raise ValueError("Not a WAV file")
+                return f, channels, size
+            else:
+                f.seek(size + (size & 1), 1)  # chunks are word-aligned
+    except Exception:
+        f.close()
+        raise
+
+
+class _RamSource:
+    """File-like readinto()/close() over the in-RAM recording, so _tx_cb has one code path
+    for SD files and (with no SD card) the last recording."""
+
+    def __init__(self, n):
+        self._pos = 0
+        self._n = n
+
+    def readinto(self, buf):
+        n = min(len(buf), self._n - self._pos)
+        buf[:n] = _audio_mv[self._pos:self._pos + n]
+        self._pos += n
+        return n
+
+    def close(self):
+        pass
+
+
+def _start_i2s(mode, sd_pin, fmt=None):
     """Creates the I2S channel, gets BCLK running, then (re)initializes the codec.
 
     BCLK must already be toggling when the codec is configured -- it derives its clock from
     BCLK (see es8311.py / music_player.py). The codec init (~350ms of register writes) also
     happens here, before any real capture/playback starts, so none of it lands in the audio.
+    fmt is I2S.MONO (default) or I2S.STEREO; in std mode BCLK is the same for both, so the
+    codec's clock setup doesn't change.
     """
     global _i2s
     _i2s = I2S(
@@ -218,7 +355,7 @@ def _start_i2s(mode, sd_pin):
         sd=sd_pin,
         mode=mode,
         bits=16,
-        format=I2S.MONO,
+        format=I2S.MONO if fmt is None else fmt,
         rate=RATE,
         ibuf=I2S_IBUF,
     )
@@ -422,7 +559,7 @@ _stalls = 0  # REPL diagnostic: how many times the watchdog had to restart the c
 
 
 def _rx_cb(_arg):
-    global _state, _pos, _recorded_len, _last_progress
+    global _state, _pos, _recorded_len, _last_progress, _unsaved
     _last_progress = time.ticks_ms()
     _pos = min(_pos + CHUNK, len(_audio))
     if _pos < len(_audio):
@@ -431,6 +568,7 @@ def _rx_cb(_arg):
         _i2s.deinit()
         touch._indev_drv.enable(True)
         _recorded_len = _pos
+        _unsaved = True
         _state = PROCESSING  # _refresh_ui runs _process() once "Processing..." is on screen
 
 
@@ -438,12 +576,16 @@ def _tx_cb(_arg):
     global _state, _pos, _nflush, _last_progress
     _last_progress = time.ticks_ms()
     if _state == PLAYING:
-        _pos = min(_pos + CHUNK, _recorded_len)
-        if _pos < _recorded_len:
-            _i2s.write(_audio_mv[_pos:min(_pos + CHUNK, _recorded_len)])
+        # _play_buf is safe to refill here: this callback means the previous write of it
+        # completed (same single-buffer pattern as wavplayer.py).
+        n = _play_src.readinto(_play_mv[:min(CHUNK, _play_len - _pos)]) if _pos < _play_len else 0
+        if n:
+            _pos += n
+            _i2s.write(_play_mv[:n])
             return
         # Let the samples still queued in the I2S internal buffer drain before stopping, so
         # the end of the recording isn't cut off (same idea as wavplayer.py's FLUSH state).
+        _play_src.close()
         _state = FLUSHING
         _nflush = I2S_IBUF // CHUNK + 1
     if _nflush > 0:
@@ -485,17 +627,39 @@ def start_recording():
     _i2s.readinto(_audio_mv[0:CHUNK])
 
 
-def start_playback():
-    global _state, _pos, _last_progress
-    if _state != IDLE or _recorded_len == 0:
+def start_playback(name=None):
+    """Streams /sd/<name>, or with name=None the last recording from RAM (no-SD-card case)."""
+    global _state, _pos, _last_progress, _play_src, _play_len, _play_rate, _play_name
+    global _idle_text, _idle_name
+    if _state != IDLE:
         return
-    _pos = 0
+    if name is None:
+        if _recorded_len == 0:
+            return
+        src, channels, length = _RamSource(_recorded_len), 1, _recorded_len
+        name = "last recording"
+    else:
+        try:
+            src, channels, length = _open_wav(name)
+        except (OSError, ValueError) as e:
+            print("Can't play", name, "-", e)
+            _idle_text = str(e) if isinstance(e, ValueError) else "Can't open file"
+            _idle_name = name
+            return
+    n = src.readinto(_play_mv[:min(CHUNK, length)])
+    if n == 0:
+        src.close()
+        _idle_text, _idle_name = "Empty file", name
+        return
+    _play_src, _play_len, _play_name = src, length, name
+    _play_rate = RATE * 2 * channels
+    _pos = n
     amp_enable.value(0)
-    _start_i2s(I2S.TX, I2S_DOUT)
+    _start_i2s(I2S.TX, I2S_DOUT, I2S.STEREO if channels == 2 else I2S.MONO)
     _last_progress = time.ticks_ms()
     _state = PLAYING
     _i2s.irq(_tx_cb)
-    _i2s.write(_audio_mv[0:min(CHUNK, _recorded_len)])
+    _i2s.write(_play_mv[:n])
 
 
 def peak_level():
@@ -550,6 +714,14 @@ BAR_H = 20
 bar_track = _panel(screen, BAR_X, BAR_Y, BAR_W, BAR_H, 0x303030)
 bar_fill = _panel(bar_track, 0, 0, 0, BAR_H, 0xFFFFFF)
 
+# Name of the file playing / last saved, unscaled (file names are too long for the 1.5x
+# status line), in its own strip under the bar.
+name_box = _panel(screen, 0, BAR_Y + BAR_H + 4, DISPLAY_WIDTH, 22, 0x000000)
+name_label = lv.label(name_box)
+name_label.set_style_text_color(lv.color_hex(0x808080), 0)
+name_label.set_text("")
+name_label.center()
+
 BUTTON_Y = 200
 BUTTON_H = DISPLAY_HEIGHT - BUTTON_Y
 REC_COLOR = 0xC00000
@@ -563,34 +735,115 @@ _scaled_label(rec_button, "RECORD", 0xFFFFFF, 2).center()
 
 play_button = _panel(screen, DISPLAY_WIDTH // 2, BUTTON_Y, DISPLAY_WIDTH // 2, BUTTON_H, DIM_COLOR)
 play_button.add_flag(lv.obj.FLAG.CLICKABLE)
-play_button.add_event_cb(lambda _e: start_playback(), lv.EVENT.CLICKED, None)
+play_button.add_event_cb(lambda _e: open_picker(), lv.EVENT.CLICKED, None)
 _scaled_label(play_button, "PLAY", 0xFFFFFF, 2).center()
+
+# --- File picker: full-screen overlay listing the SD card's .wav files ---------------------
+# Built on demand and deleted on close. Its text uses the native 16px font rather than the
+# transform_scale trick: scaled labels inside a scrolling container would hit the stale-
+# render invalidation problem described in CLAUDE.md.
+PICKER_HEADER_H = 60
+PICKER_ROW_H = 56
+_picker = None
+
+
+def open_picker():
+    global _picker, _idle_text, _last_ui
+    if _state != IDLE or _picker is not None:
+        return
+    if not _sd_ok:
+        start_playback()  # no card: replay the last recording from RAM
+        return
+    try:
+        names = _list_wavs()
+    except OSError as e:
+        print("Listing SD card failed:", e)
+        _idle_text, _last_ui = "SD card error", None
+        return
+
+    _picker = _panel(screen, 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, 0x000000)
+    _picker.set_style_text_font(lv.font_montserrat_16, 0)
+
+    back = _panel(_picker, 0, 0, DISPLAY_WIDTH, PICKER_HEADER_H, DIM_COLOR)
+    back.add_flag(lv.obj.FLAG.CLICKABLE)
+    back.add_event_cb(lambda _e: close_picker(), lv.EVENT.CLICKED, None)
+    for text, align, dx in (("<  Back", lv.ALIGN.LEFT_MID, 16),
+                            ("Choose a file", lv.ALIGN.RIGHT_MID, -16)):
+        label = lv.label(back)
+        label.set_text(text)
+        label.set_style_text_color(lv.color_hex(0xFFFFFF), 0)
+        label.align(align, dx, 0)
+
+    file_list = lv.list(_picker)
+    file_list.set_size(DISPLAY_WIDTH, DISPLAY_HEIGHT - PICKER_HEADER_H)
+    file_list.set_pos(0, PICKER_HEADER_H)
+    file_list.set_style_bg_color(lv.color_hex(0x000000), 0)
+    file_list.set_style_border_width(0, 0)
+    file_list.set_style_radius(0, 0)
+    file_list.set_style_pad_all(0, 0)
+    file_list.set_style_pad_row(0, 0)
+    if _unsaved and _recorded_len:
+        # A failed save leaves the recording only in RAM -- still let it be played.
+        row = file_list.add_button(None, "(unsaved) last recording")
+        row.set_height(PICKER_ROW_H)
+        row.set_style_bg_color(lv.color_hex(0x101010), 0)
+        row.set_style_text_color(lv.color_hex(0xFFC000), 0)
+        row.add_event_cb(lambda _e: _pick(None), lv.EVENT.CLICKED, None)
+    elif not names:
+        file_list.add_text("No .wav files on the SD card")
+    for name in names:
+        row = file_list.add_button(None, name)
+        row.set_height(PICKER_ROW_H)
+        row.set_style_bg_color(lv.color_hex(0x101010), 0)
+        row.set_style_text_color(lv.color_hex(0xFFFFFF), 0)
+        row.set_style_border_color(lv.color_hex(0x303030), 0)
+        row.add_event_cb(lambda _e, n=name: _pick(n), lv.EVENT.CLICKED, None)
+
+
+def close_picker():
+    global _picker, _last_ui
+    if _picker is None:
+        return
+    # delete_async: this runs inside an event callback of one of the picker's own children.
+    _picker.delete_async()
+    _picker = None
+    _last_ui = None  # redraw the main screen's status/buttons next tick
+
+
+def _pick(name):
+    close_picker()
+    start_playback(name)
+
 
 _last_ui = None
 PROCESSING_TEXT = "Processing..."
 SAVING_TEXT = "Saving..."
 _idle_text = "Tap RECORD"
+_idle_name = ""  # file name shown under the bar while idle (last saved / last played)
 
 
 def _refresh_ui(_timer):
-    global _last_ui, _state, _idle_text
+    global _last_ui, _state, _idle_text, _idle_name
     _check_stall()
+    if _picker is not None:
+        return  # the picker covers the whole screen; nothing here is visible
     # Processing and saving each block the UI for ~1s, so each is deferred to here (rather than
     # run at the end of _rx_cb) and only runs once its status text was drawn on a previous tick.
     shown = _last_ui[0] if _last_ui is not None else None
     if _state == PROCESSING and shown == PROCESSING_TEXT:
         _process()
-        _idle_text = "Ready"
+        _idle_text, _idle_name = "Ready", ""
         _state = SAVING if _sd_ok else IDLE
     elif _state == SAVING and shown == SAVING_TEXT:
         try:
             _save()
-            _idle_text = "Saved " + _last_saved
+            _idle_text, _idle_name = "Saved", _last_saved
         except OSError as e:
             print("Saving recording failed:", e)
             _idle_text = "Save failed"
         _state = IDLE
     state, pos = _state, _pos
+    name = _idle_name
     if state == PROCESSING:
         text = PROCESSING_TEXT
         fill = BAR_W
@@ -601,19 +854,25 @@ def _refresh_ui(_timer):
         remaining = (len(_audio) - pos) // (RATE * 2) + 1
         text = "Recording... %ds" % min(remaining, RECORD_SECONDS)
         fill = pos * BAR_W // len(_audio)
+        name = ""
     elif state in (PLAYING, FLUSHING):
-        remaining = (_recorded_len - pos) // (RATE * 2) + 1
-        text = "Playing... %ds" % min(remaining, RECORD_SECONDS)
-        fill = pos * BAR_W // _recorded_len
+        remaining = (_play_len - pos) // _play_rate + 1
+        text = "Playing... %d:%02d" % (remaining // 60, remaining % 60)
+        fill = pos * BAR_W // _play_len
+        name = _idle_name = _play_name
+        _idle_text = "Played"
     else:
         text = _idle_text
         fill = 0
     idle = state == IDLE
-    ui = (text, fill, idle)
+    ui = (text, fill, idle, name)
     if ui == _last_ui:
         return
     last, _last_ui = _last_ui, ui
     bar_fill.set_width(fill)
+    if last is None or last[3] != name:
+        name_label.set_text(name)
+        name_box.invalidate()
     if last is None or last[0] != text:
         status.set_text(text)
         # set_text() on a transform_scale'd label doesn't invalidate where an earlier,
@@ -624,7 +883,7 @@ def _refresh_ui(_timer):
     if last is None or last[2] != idle:
         rec_button.set_style_bg_color(lv.color_hex(REC_COLOR if idle else DIM_COLOR), 0)
         play_button.set_style_bg_color(
-            lv.color_hex(PLAY_COLOR if idle and _recorded_len else DIM_COLOR), 0
+            lv.color_hex(PLAY_COLOR if idle and (_sd_ok or _recorded_len) else DIM_COLOR), 0
         )
 
 
@@ -634,4 +893,4 @@ _ui_timer = lv.timer_create(_refresh_ui, 100, None)
 # rendering/responding to touch after this script finishes running.
 task_handler = TaskHandler()
 
-print("Voice recorder running. Tap RECORD to capture %ds, then PLAY." % RECORD_SECONDS)
+print("Voice recorder running. Tap RECORD to capture %ds, PLAY to pick a file." % RECORD_SECONDS)

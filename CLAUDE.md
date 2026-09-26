@@ -279,6 +279,29 @@ things surfaced on hardware that apply to any future combined script (e.g. a mus
   UI with a stale status line. The SD card is mounted with the same `machine.SDCard` call as
   `music_player.py` (see the SDCard section above), after display init, and it coexists with
   the QSPI display and I2S without problems.
+- **WiFi for timestamps, then off.** Recordings are named from one WiFi+NTP sync at startup
+  (`local_time.py`, done after display/touch init like any other late import). Confirmed on
+  hardware that this coexists with the display/touch stack. **WiFi must be shut down with
+  `wlan.disconnect()` before `wlan.active(False)`.** With `active(False)` alone, the mic
+  recorded only its noise floor for the rest of the session: 100ms-window peaks had a median
+  of 91 while someone was talking, versus ~360 with no WiFi at all. Playback was unaffected,
+  which made this look like a playback bug at first (the recordings "played silently"). The
+  cause is unknown; the disconnect-first fix was confirmed on hardware. The first NTP attempt
+  often fails with `OSError(116)` (a timeout) right after connecting, so keep the retries.
+- **Playback streams from SD.** PLAY opens a file picker, and the chosen file is read
+  `CHUNK` bytes at a time inside `_tx_cb`, so the same stall watchdog covers it. Songs don't
+  fit in the 882KB record buffer. Only 44100Hz/16-bit PCM is accepted (`_open_wav()` walks the
+  RIFF chunks). Stereo is fine, because std-mode BCLK is the same for mono and stereo. The
+  picker is deleted with `delete_async()`, since it's closed from an event callback of one of
+  its own children.
+- **SD writes can fail silently.** Seen on hardware (2026-09-26): the card got into a state
+  where every write, even a 5-byte file from a clean boot with nothing else running, returned
+  the full byte count from `write()`, raised nothing on `close()`, and left a 0-byte file.
+  Directory changes (creating and deleting files) still worked, and so did reads. Windows
+  `chkdsk` found no errors, and after the card was re-inserted, writes worked again. The cause
+  is unknown. Don't trust `write()`'s return value for anything important: `_save()` checks
+  `os.stat()` afterwards, reports "Save failed" if the size is wrong, and the picker offers the
+  RAM copy as "(unsaved) last recording".
 
 ## LVGL Python binding quirks
 
