@@ -105,6 +105,10 @@ took three separate, stacked fixes — worth knowing about before touching this 
   re-slicing the *complete* accumulated image into 40-row, full-CASET/narrow-RASET bands
   (matching portrait mode's own proven-safe chunk size exactly) and sending those,
   synchronously. Never send a narrow-CASET/full-RASET window to this panel again.
+  **Refined 2026-10-30 (see "Write windows must be 8-pixel column aligned" below):** the real
+  rule appears to be column alignment, not narrowness or height. Landscape's narrow windows
+  were chunk-height wide (e.g. 26px), which is not a multiple of 8. That would explain the
+  failure, but landscape itself hasn't been re-tested with aligned windows.
 - **A stale-text "ghosting" bug**, found only after the two fixes above (a full redraw is fast
   enough now that this could actually be observed cleanly): `ntp_clock.py`'s per-second
   `set_text()` on a `transform_scale`-enlarged label only invalidates that label's *current*
@@ -114,6 +118,25 @@ took three separate, stacked fixes — worth knowing about before touching this 
   in `ST77922Landscape` itself. Fixed pragmatically in `ntp_clock.py` with an unconditional
   `screen.invalidate()` every tick rather than root-causing the LVGL interaction further —
   cheap now that a full redraw is ~100ms instead of 60+ seconds.
+
+### Write windows must be 8-pixel column aligned (`ST77922._round_area_cb`)
+
+Found with `sound_meter.py`, whose `lv.chart` in CIRCULAR mode only invalidates a thin vertical
+strip per point: the chart area filled with snow in plain portrait mode. A raw-window test on
+hardware (no LVGL; black windows sent onto a white screen) showed which windows render
+correctly:
+
+| Window columns | Width | Result |
+|---|---|---|
+| 0..319, 0..159, 160..319, 64..127, 0..7 | multiple of 8 | clean |
+| various x | 2, 6 or 38 | green, sometimes noisy |
+| 0..318 | 319 | green |
+
+Height made no difference: a single 6x40 window failed too. Before this, portrait scripts mostly
+got away with it because their redraws were full-width or happened to be aligned.
+`ST77922.__init__` now registers an `lv.EVENT.INVALIDATE_AREA` handler that rounds every
+invalidated area out to 8-pixel column boundaries (`x1 &= ~7`, `x2 |= 7`) before LVGL renders
+it. This fixes every script that uses the driver, and it costs almost nothing. Keep it.
 
 If any of this needs re-testing: `mpremote connect COM12 ...` (used throughout this project's
 development) only performs a **soft** reset (Python globals wiped, like Ctrl-D) — it does
@@ -242,6 +265,15 @@ least one of them (this one) was wrong.
 `voice_recorder.py` is the first script to run audio and LVGL/touch in one process. These
 things surfaced on hardware that apply to any future combined script (e.g. a music player UI):
 
+- **Render cost decides whether audio keeps up** (measured for `sound_meter.py`, 2026-10-30,
+  by timing `lv.task_handler()` with each widget alone, at a 10 Hz UI rate). Continuous I2S RX
+  plus per-frame analysis costs ~84ms of CPU per second. An `lv.chart` in `SHIFT` update mode
+  redraws the whole chart for every point: ~58ms per redraw at 220x340, or ~580ms/s. With the
+  rest of the UI, that saturated the CPU and the I2S callbacks fell behind, so only 10-17 of
+  21.5 frames/s arrived. This showed up as dropped audio, not as watchdog stalls. `CIRCULAR`
+  mode only redraws around the new point (~70ms/s). A 2x `transform_scale` label costs ~22ms
+  per text change, whatever the size of the box it sits in; an unscaled one is nearly free.
+  Budget these before adding a busy widget to an audio script.
 - **One I2C host 0 for both codec and touch.** They share pins 39/38, and host 0 can't be
   opened twice. Pass the touch driver's `i2c.I2C.Bus` straight to `ES8311(...)` — it wraps
   `machine.I2C` and has the same `writeto_mem()` the codec driver uses.

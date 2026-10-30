@@ -30,7 +30,7 @@ stock MicroPython.
 | Touch (I2C, addr `0x55`, 16-bit register addresses) | `SCL=39 SDA=38 RST=48 INT=47` |
 | SD card (SDMMC, 4-bit)* | `CLK=5 CMD=4 D0=6 D1=7 D2=2 D3=3` |
 | Audio: I2S to ES8311 DIN* | `BCK=18 WS=21 SD=15` (MCK=17 exists but is unused -- see `es8311.py`) |
-| Audio: I2S from ES8311 ADC (onboard MEMS mic)* | `DIN=16` (shares BCK/WS above; used by `voice_recorder.py`) |
+| Audio: I2S from ES8311 ADC (onboard MEMS mic)* | `DIN=16` (shares BCK/WS above; used by `voice_recorder.py` and `sound_meter.py`) |
 | Audio: ES8311 control (I2C, addr `0x18`)* | `SCL=39 SDA=38` (shares the touch controller's bus) |
 | Audio: speaker amp enable* | `GPIO 1` (active-LOW -- confirmed on hardware; docs.freenove.com didn't document polarity) |
 | Onboard RGB LED (WS2812) | `GPIO 40` |
@@ -62,6 +62,7 @@ on stock MicroPython too.
 | `wifi_secrets.py.example` | Template for `wifi_secrets.py` (gitignored) -- copy and fill in real WiFi `SSID`/`PASSWORD` before running `ntp_clock.py` or `voice_recorder.py` (the recorder still works without it, but names files `recNNN.wav`). |
 | `music_player.py` | Plays a WAV file from the SD card over the onboard ES8311 codec/speaker; currently plays `demo1.wav` on run. Confirmed working end-to-end on hardware. Starting point for a future full SD-card music player. |
 | `voice_recorder.py` | Touchscreen voice recorder (portrait): RECORD captures 10s from the onboard mic into RAM. Each recording is cleaned up in software (100Hz-4kHz band-pass, noise gate, normalization), then saved to the SD card as `rec_YYYYMMDD_HHMMSS.wav` (Mountain time, from one WiFi+NTP sync at startup via `local_time.py`; falls back to `recNNN.wav` if the sync fails). PLAY opens a scrollable list of the SD card's root `.wav` files; tapping one streams it from the card (44100Hz/16-bit PCM, mono or stereo). Each save is checked by reading back the file size; a failed save shows "Save failed", and the recording stays playable from the list as "(unsaved) last recording". With no card inserted, saving is skipped and PLAY replays the last recording from RAM. Confirmed working on hardware. |
+| `sound_meter.py` | Live mic level meter: ~10s sweeping dBFS history graph (`lv.chart`) plus a VU bar with peak hold, in portrait. Touch is never initialized (its I2C polling would put clicks into the mic). Structured so a spectrum (FFT) view can be added later -- see its docstring. |
 | `local_time.py` | Helper module: WiFi connect (`wifi_secrets.py`), NTP sync, and Mountain Time (US DST rules). Copied from `ntp_clock.py`; used by `voice_recorder.py`. |
 | `es8311.py` | I2C driver for the ES8311 audio codec, ported from raptor09010's `Micropython-ES8311-Library`. Playback, plus mic/ADC input via `enable_mic()`. |
 | `wavplayer.py` | Non-blocking WAV-over-I2S player, from Mike Teachman's `micropython-i2s-examples` (via the same ES8311 library repo above). |

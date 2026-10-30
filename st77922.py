@@ -182,6 +182,23 @@ class ST77922(display_driver_framework.DisplayDriver):
             _init_bus=True
         )
 
+        self._disp_drv.add_event_cb(self._round_area_cb, lv.EVENT.INVALIDATE_AREA, None)  # NOQA
+
+    # This panel only renders a write window correctly when its columns are aligned to 8
+    # pixels. Confirmed on hardware (2026-10-30) with raw black windows on a white screen:
+    # x 0..319, 0..159, 160..319, 64..127 and 0..7 were all clean. Windows 2, 6 and 38px wide
+    # (at various x), and x 0..318 (one pixel short of full width), rendered green/noisy. That
+    # held at every height, even a single 40-row window. LVGL sends whatever area was
+    # invalidated, so a thin widget (an lv.chart's CIRCULAR-mode point strip in sound_meter.py,
+    # a progress bar) produced snow. Round every invalidated area out to 8-pixel column
+    # boundaries before LVGL renders it. 320 is a multiple of 8, so x2 | 7 never leaves the
+    # screen. Harmless for ST77922Landscape, which always sends full-width bands anyway.
+    @staticmethod
+    def _round_area_cb(e):
+        area = lv.area_t.__cast__(e.get_param())  # NOQA
+        area.x1 &= ~7
+        area.x2 |= 7
+
     def set_params(self, cmd, params=None):
         cmd = self.__cmd_modifier(cmd)
         self._data_bus.tx_param(cmd, params)
