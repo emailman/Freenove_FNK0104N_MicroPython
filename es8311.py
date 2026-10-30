@@ -1,6 +1,15 @@
 """
 Driver for the ES8311 low-power audio codec used for speaker playback on the FNK0104N (see
-music_player.py for wiring). DAC/playback path only -- no mic/ADC support.
+music_player.py for wiring). DAC/playback via power_on(); the onboard MEMS mic (ADC path, data
+back to the ESP32 on I2S DIN = GPIO16) is enabled on top of that with enable_mic() -- see
+voice_recorder.py.
+
+enable_mic()'s register values are taken from Espressif's same official driver (esp-bsp
+es8311.c): es8311_microphone_config() (0x14=0x1A analog mic + PGA, 0x17=0xC8 ADC volume),
+es8311_microphone_gain_set() (0x16 = 0..7 -> 0..42dB in 6dB steps), and es8311_fmt_config()
+(SDP-out 0x0A=0x0C: 16-bit I2S with bit 6 clear). _POWER_UP below writes 0x0A=0x4C, i.e. bit 6
+set, which mutes the ADC's serial output -- harmless for playback-only use, but it has to be
+cleared for recording. 0x44=0x08 (ADC data on the SDP output) matches esp-adf's ES8311 init.
 
 Register table originally ported from raptor09010's Micropython-ES8311-Library (MIT license,
 github.com/raptor09010/Micropython-ES8311-Library), then corrected against Espressif's own
@@ -110,6 +119,17 @@ class ES8311:
         for reg, val in _POWER_DOWN:
             self._write(reg, val)
             time.sleep_ms(10)  # NOQA
+
+    def enable_mic(self, gain=4):
+        """Enables the analog mic -> ADC -> SDP-out path. Call after power_on().
+
+        gain: mic PGA gain, 0..7 = 0..42dB in 6dB steps (default 4 = 24dB).
+        """
+        self._write(0x0A, 0x0C)  # SDP out: 16-bit I2S, unmuted (bit 6 clear)
+        self._write(0x14, 0x1A)  # analog mic input, PGA enabled
+        self._write(0x16, max(0, min(7, gain)))
+        self._write(0x17, 0xC8)  # ADC digital volume
+        self._write(0x44, 0x08)  # ADC data -> SDP out
 
     def set_volume(self, percent):
         percent = max(0, min(100, percent))

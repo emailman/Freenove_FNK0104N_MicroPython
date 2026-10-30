@@ -105,6 +105,10 @@ took three separate, stacked fixes — worth knowing about before touching this 
   re-slicing the *complete* accumulated image into 40-row, full-CASET/narrow-RASET bands
   (matching portrait mode's own proven-safe chunk size exactly) and sending those,
   synchronously. Never send a narrow-CASET/full-RASET window to this panel again.
+  **Refined 2026-10-30 (see "Write windows must be 8-pixel column aligned" below):** the real
+  rule appears to be column alignment, not narrowness or height. Landscape's narrow windows
+  were chunk-height wide (e.g. 26px), which is not a multiple of 8. That would explain the
+  failure, but landscape itself hasn't been re-tested with aligned windows.
 - **A stale-text "ghosting" bug**, found only after the two fixes above (a full redraw is fast
   enough now that this could actually be observed cleanly): `ntp_clock.py`'s per-second
   `set_text()` on a `transform_scale`-enlarged label only invalidates that label's *current*
@@ -114,6 +118,25 @@ took three separate, stacked fixes — worth knowing about before touching this 
   in `ST77922Landscape` itself. Fixed pragmatically in `ntp_clock.py` with an unconditional
   `screen.invalidate()` every tick rather than root-causing the LVGL interaction further —
   cheap now that a full redraw is ~100ms instead of 60+ seconds.
+
+### Write windows must be 8-pixel column aligned (`ST77922._round_area_cb`)
+
+Found with `sound_meter.py`, whose `lv.chart` in CIRCULAR mode only invalidates a thin vertical
+strip per point: the chart area filled with snow in plain portrait mode. A raw-window test on
+hardware (no LVGL; black windows sent onto a white screen) showed which windows render
+correctly:
+
+| Window columns | Width | Result |
+|---|---|---|
+| 0..319, 0..159, 160..319, 64..127, 0..7 | multiple of 8 | clean |
+| various x | 2, 6 or 38 | green, sometimes noisy |
+| 0..318 | 319 | green |
+
+Height made no difference: a single 6x40 window failed too. Before this, portrait scripts mostly
+got away with it because their redraws were full-width or happened to be aligned.
+`ST77922.__init__` now registers an `lv.EVENT.INVALIDATE_AREA` handler that rounds every
+invalidated area out to 8-pixel column boundaries (`x1 &= ~7`, `x2 |= 7`) before LVGL renders
+it. This fixes every script that uses the driver, and it costs almost nothing. Keep it.
 
 If any of this needs re-testing: `mpremote connect COM12 ...` (used throughout this project's
 development) only performs a **soft** reset (Python globals wiped, like Ctrl-D) — it does
@@ -236,6 +259,81 @@ amp hardware fault — the amp was simply being told to stay off the whole time.
 remembering if silent/no-output symptoms come up again here: don't assume a hardware fault
 before double-checking enable-pin polarity assumptions sourced from docs.freenove.com, since at
 least one of them (this one) was wrong.
+
+## Combining audio with the display/touch stack (`voice_recorder.py`)
+
+`voice_recorder.py` is the first script to run audio and LVGL/touch in one process. These
+things surfaced on hardware that apply to any future combined script (e.g. a music player UI):
+
+- **Render cost decides whether audio keeps up** (measured for `sound_meter.py`, 2026-10-30,
+  by timing `lv.task_handler()` with each widget alone, at a 10 Hz UI rate). Continuous I2S RX
+  plus per-frame analysis costs ~84ms of CPU per second. An `lv.chart` in `SHIFT` update mode
+  redraws the whole chart for every point: ~58ms per redraw at 220x340, or ~580ms/s. With the
+  rest of the UI, that saturated the CPU and the I2S callbacks fell behind, so only 10-17 of
+  21.5 frames/s arrived. This showed up as dropped audio, not as watchdog stalls. `CIRCULAR`
+  mode only redraws around the new point (~70ms/s). A 2x `transform_scale` label costs ~22ms
+  per text change, whatever the size of the box it sits in; an unscaled one is nearly free.
+  Budget these before adding a busy widget to an audio script.
+- **One I2C host 0 for both codec and touch.** They share pins 39/38, and host 0 can't be
+  opened twice. Pass the touch driver's `i2c.I2C.Bus` straight to `ES8311(...)` — it wraps
+  `machine.I2C` and has the same `writeto_mem()` the codec driver uses.
+- **Non-blocking I2S callbacks get silently dropped.** `machine.I2S` IRQ callbacks go through
+  `micropython.schedule()`, whose queue is shared with LVGL's task handler and touch polling.
+  When it's full, the completion callback is lost and the transfer chain just stops — no
+  exception (playback stuck at position 0). `voice_recorder.py` needed 5 watchdog restarts
+  across a handful of touch-driven record/play runs, so this is common, not a rare edge case.
+  Its fix: the 100ms LVGL UI timer re-invokes the callback if audio has made no progress for
+  500ms. Also keep LVGL redraws small (no full-screen `invalidate()` every tick) and I2S
+  buffers generous (`ibuf=40000`). Before either of those, a 10s recording took ~40s.
+- **Touch polling puts clicks into the mic.** Every LVGL touch read is I2C traffic on the bus
+  shared with the codec, and it couples into the mic input. Measured on a silent recording: a
+  ~0.5ms click every ~33ms (the indev read period), peaking ~750 raw — only ~9dB below
+  speech, so no noise gate can separate them, and heard as "static" after normalization.
+  With `touch._indev_drv.enable(False)` for the duration of the recording: zero clicks, peak
+  162. `voice_recorder.py` pauses touch while recording for this reason.
+- **Mic path:** `ES8311.enable_mic()`. Note that `_POWER_UP`'s `0x0A=0x4C` mutes the ADC's
+  serial output (bit 6) — fine for playback, and `enable_mic()` clears it. Raw speech at
+  36dB mic gain only peaks at ~2400/32767, so recordings are normalized in software (viper)
+  instead of adding more analog gain.
+- **Post-processing chain** (`_process()`, run once after each recording): one-pole 100Hz
+  high-pass + Butterworth 4kHz low-pass biquad, then a 10ms-window noise gate (-12dB floor,
+  200ms hold, one window of look-ahead, linear gain ramps), then normalization. It's all
+  integer math in `@micropython.viper` (the filter in Q13/Q15 fixed point) — the full
+  441k-sample pass takes ~1s. Two things to know if you edit it: viper functions take at most
+  4 arguments, which is why coefficients are passed as an `array("i")`; and the gate
+  threshold (200 raw) was calibrated against a silent, filtered recording whose 10ms window
+  peaks never exceeded 98. Re-measure if `MIC_GAIN` or the filter cutoffs change. Once touch
+  polling was paused, the gate helped; before that it couldn't have, as explained above.
+- **Processing and saving are deferred to the LVGL timer.** `_rx_cb` only sets a
+  `PROCESSING` state. The UI timer runs `_process()` on the tick *after* "Processing..." has
+  been drawn, then does the same for `SAVING` / `_save()`. Each step blocks for ~1s (processing)
+  or ~2.6s (the SD write of 882KB). Running them directly in the I2S callback would freeze the
+  UI with a stale status line. The SD card is mounted with the same `machine.SDCard` call as
+  `music_player.py` (see the SDCard section above), after display init, and it coexists with
+  the QSPI display and I2S without problems.
+- **WiFi for timestamps, then off.** Recordings are named from one WiFi+NTP sync at startup
+  (`local_time.py`, done after display/touch init like any other late import). Confirmed on
+  hardware that this coexists with the display/touch stack. **WiFi must be shut down with
+  `wlan.disconnect()` before `wlan.active(False)`.** With `active(False)` alone, the mic
+  recorded only its noise floor for the rest of the session: 100ms-window peaks had a median
+  of 91 while someone was talking, versus ~360 with no WiFi at all. Playback was unaffected,
+  which made this look like a playback bug at first (the recordings "played silently"). The
+  cause is unknown; the disconnect-first fix was confirmed on hardware. The first NTP attempt
+  often fails with `OSError(116)` (a timeout) right after connecting, so keep the retries.
+- **Playback streams from SD.** PLAY opens a file picker, and the chosen file is read
+  `CHUNK` bytes at a time inside `_tx_cb`, so the same stall watchdog covers it. Songs don't
+  fit in the 882KB record buffer. Only 44100Hz/16-bit PCM is accepted (`_open_wav()` walks the
+  RIFF chunks). Stereo is fine, because std-mode BCLK is the same for mono and stereo. The
+  picker is deleted with `delete_async()`, since it's closed from an event callback of one of
+  its own children.
+- **SD writes can fail silently.** Seen on hardware (2026-09-26): the card got into a state
+  where every write, even a 5-byte file from a clean boot with nothing else running, returned
+  the full byte count from `write()`, raised nothing on `close()`, and left a 0-byte file.
+  Directory changes (creating and deleting files) still worked, and so did reads. Windows
+  `chkdsk` found no errors, and after the card was re-inserted, writes worked again. The cause
+  is unknown. Don't trust `write()`'s return value for anything important: `_save()` checks
+  `os.stat()` afterwards, reports "Save failed" if the size is wrong, and the picker offers the
+  RAM copy as "(unsaved) last recording".
 
 ## LVGL Python binding quirks
 
