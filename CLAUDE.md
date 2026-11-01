@@ -274,6 +274,19 @@ things surfaced on hardware that apply to any future combined script (e.g. a mus
   mode only redraws around the new point (~70ms/s). A 2x `transform_scale` label costs ~22ms
   per text change, whatever the size of the box it sits in; an unscaled one is nearly free.
   Budget these before adding a busy widget to an audio script.
+- **LVGL itself is too slow for animation across many small areas** (measured 2026-10-31 for
+  `spectrum_analyzer.py` by timing `lv.refr_now()`). Each dirty area costs ~3ms, however small:
+  1 area of 8x8 took 3.4ms, 32 of them took 111ms. Drawing costs ~1us per pixel: a 256x340 area
+  took 110ms, of which the flush was 21ms. 32 animated `lv.obj` bars cut the audio to 4-9 of
+  21.5 frames/s, and once hung the board so hard it needed a RESET press (no serial at all). The
+  fix: draw the animated region yourself (viper, into an `allocate_framebuffer(SPIRAM|DMA)`
+  buffer) and send it with the same synchronous `register_callback(None)` /
+  `_set_memory_location` / `tx_color` sequence as `ST77922Landscape._flush_cb`, from an LVGL
+  timer (LVGL has finished its own flushes by then). Leave LVGL just the static parts. Two
+  rules: keep the window 8 px column aligned (the INVALIDATE_AREA rounding doesn't apply to
+  direct writes), and write **native** RGB565, because the bus applies `rgb565_byte_swap` to
+  `tx_color()` data itself. Pre-swapped colors came out byte-reversed (0x101010 grey showed
+  as purple).
 - **One I2C host 0 for both codec and touch.** They share pins 39/38, and host 0 can't be
   opened twice. Pass the touch driver's `i2c.I2C.Bus` straight to `ES8311(...)` — it wraps
   `machine.I2C` and has the same `writeto_mem()` the codec driver uses.

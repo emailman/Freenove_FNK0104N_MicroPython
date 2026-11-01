@@ -32,15 +32,7 @@ at the 10 Hz UI rate, in ms of CPU per second):
     redrawn. That's why the graph sweeps left to right like an ECG monitor, with a cursor at
     the write position, instead of scrolling.
 
-Future spectrum view -- the structure is already split for it:
-  - FRAME is a power of two: a 1024- or 2048-point FFT at 44100Hz gives 43 or 21.5 Hz bins.
-  - Per-frame work in _rx_cb must stay cheap (it delays the next readinto()); an FFT would
-    run in the UI timer on _bufs[_latest] instead, the most recent complete frame.
-  - The plan is a Q15 fixed-point radix-2 FFT in @micropython.viper with a precomputed
-    twiddle array("h") and a Hann window, log-spaced bands, and an lv.chart BAR series. Check
-    help('modules') for ulab first; this firmware almost certainly doesn't include it.
-  - The UI for each view is built by its own function on its own container
-    (_build_level_view), so a _build_spectrum_view can be swapped in once there are controls.
+The spectrum (FFT) view is a separate program: spectrum_analyzer.py.
 
 Requires the custom lvgl_micropython firmware -- see hello_world_display.py / README.md.
 """
@@ -221,7 +213,7 @@ def _start_i2s():
 
 
 # I2S callbacks go through micropython.schedule(), whose queue is shared with LVGL; when it's
-# full a callback is silently dropped and the read chain just stops (see voice_recorder.py).
+#  full, a callback is silently dropped and the read chain just stops (see voice_recorder.py).
 # The UI timer restarts the chain if no frame has arrived for STALL_MS.
 STALL_MS = 500
 _stalls = 0
@@ -371,7 +363,7 @@ def _update_level_view(v, db):
 
 level_view = _build_level_view(screen)
 
-DEBUG = True  # prints frames/s, stalls, level and UI tick time once a second
+DEBUG = False  # prints frames/s, stalls, level and UI tick time once a second
 _tick = 0
 _readout_text = None
 _debug_ms = time.ticks_ms()
