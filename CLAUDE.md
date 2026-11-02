@@ -286,7 +286,16 @@ things surfaced on hardware that apply to any future combined script (e.g. a mus
   rules: keep the window 8 px column aligned (the INVALIDATE_AREA rounding doesn't apply to
   direct writes), and write **native** RGB565, because the bus applies `rgb565_byte_swap` to
   `tx_color()` data itself. Pre-swapped colors came out byte-reversed (0x101010 grey showed
-  as purple).
+  as purple). That swap happens **in place in your buffer**, so never send the same buffer
+  twice without redrawing it: `rainbow_fade.py` filled one 40-row band and sent it 12 times,
+  and every other band on screen came out byte-swapped (2026-11-02).
+- **Long synchronous panel writes starve I2S output, even with CPU to spare** (measured
+  2026-11-02 for `rainbow_fade.py`). Painting the full screen in one go (12 synchronous 40-row
+  `tx_color()` bands, ~39ms of busy-waiting) let a generated tone's TX callbacks fall from the
+  43/s it needs to 20/s, heard as static. That happened even at 10 repaints/s with ~40% of the
+  CPU idle, and with no stalls, so this isn't the dropped-callback problem described below. The
+  hardware was simply running out of audio. 1-4 bands per LVGL tick held a steady 43/s, so
+  spread big direct writes across ticks.
 - **One I2C host 0 for both codec and touch.** They share pins 39/38, and host 0 can't be
   opened twice. Pass the touch driver's `i2c.I2C.Bus` straight to `ES8311(...)` — it wraps
   `machine.I2C` and has the same `writeto_mem()` the codec driver uses.
