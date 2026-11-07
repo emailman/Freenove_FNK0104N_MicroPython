@@ -157,89 +157,100 @@ screen.set_style_bg_opa(lv.OPA.COVER, 0)
 # monospace font (LV_FONT_UNSCII_16) was considered and declined in favor of this same-day,
 # no-rebuild fix.
 #
-# Cell widths below are *pre-scale* (native 14px-font) pixel widths, measured from
-# lv_font_montserrat_14.c directly, rounded up ~1px for margin. Digit/punctuation/space
-# glyphs are identical metrics regardless of row, so those constants are shared; the letter
-# cell width is kept separate per row since each string's widest actual letter differs
-# ('M' at 13px for AM/PM/MDT/MST vs 'W' at 16px for "Wed").
+# Only the digits need this. Text that changes rarely is drawn as whole words, so its letters
+# keep the font's natural spacing. One cell per letter, sized for the widest letter, centered
+# each glyph and left visible gaps: in "MST", M is 13.4px but S and T are only ~8.5px, so the T
+# looked detached. That's why the AM/PM + time-zone suffix is one word slot, and the date
+# (which only changes at midnight) is a single ordinary label.
+#
+# Widths below are *pre-scale* (native 14px-font) pixel widths, measured from
+# lv_font_montserrat_14.c directly (adv_w / 16), rounded up for margin.
 _DIGIT_W = 10
-_PUNCT_W = 4    # ':' and ','
+_PUNCT_W = 4    # ':'
 _SPACE_W = 4
-_TIME_LETTER_W = 14
-_DATE_LETTER_W = 16
-
-# One entry per character position of "%02d:%02d:%02d %s %s" (hour12, minute, second, am_pm, abbr)
-TIME_SLOT_WIDTHS = (
-    _DIGIT_W, _DIGIT_W, _PUNCT_W,                       # HH:
-    _DIGIT_W, _DIGIT_W, _PUNCT_W,                       # MM:
-    _DIGIT_W, _DIGIT_W, _SPACE_W,                       # SS_
-    _TIME_LETTER_W, _TIME_LETTER_W, _SPACE_W,           # AM/PM_
-    _TIME_LETTER_W, _TIME_LETTER_W, _TIME_LETTER_W,     # MDT/MST
-)  # 15 slots -- always exactly 15 chars, no padding ever needed (every field is fixed-width)
-
-# One entry per character position of "%s, %s %2d %d" (weekday, month, day, year)
-DATE_SLOT_WIDTHS = (
-    _DATE_LETTER_W, _DATE_LETTER_W, _DATE_LETTER_W, _PUNCT_W, _SPACE_W,   # "Sat, "
-    _DATE_LETTER_W, _DATE_LETTER_W, _DATE_LETTER_W, _SPACE_W,             # "Sep "
-    _DIGIT_W, _DIGIT_W, _SPACE_W,                                        # "12 " (day, %2d-padded)
-    _DIGIT_W, _DIGIT_W, _DIGIT_W, _DIGIT_W,                               # "2026"
-)  # 16 slots
+_SUFFIX_W = 62  # widest "AM/PM zone" word: "PM MDT" = 23.5 + 3.75 + 33.2 px
 
 
-def _make_char_row(parent, slot_widths, scale, color, dy):
-    """Creates one lv.label per character position under `parent`, laid out in a fixed-pitch
-    row and never repositioned again -- only set_text() (via _set_row_text) changes after this.
-    Each label's own CENTER (not its left edge) is pinned at its slot's (dx, dy), computed
-    once here from slot_widths; LVGL re-applies that alignment automatically whenever a later
-    set_text() changes the label's auto-fit size (same mechanism that made the ghost-text bug
-    possible in the first place -- see the comment on screen.invalidate() in _refresh), so
-    each character re-centers within its own fixed slot as its glyph width changes (e.g. '1'
-    vs '8') without ever drifting into a neighboring slot.
+def _cell(w):
+    """One character, auto-fit and centered in its slot (digits, ':')."""
+    return (w, False)
 
-    slot_widths are *pre-scale* pixel widths (native 14px-font metrics); align()'s x_ofs/y_ofs
+
+def _word(w):
+    """A whole word in a fixed-width, left-aligned box, drawn with natural letter spacing."""
+    return (w, True)
+
+
+# Slots of "%02d:%02d:%02d " (one per character) followed by "%s %s" (am_pm, abbr) as one word
+TIME_SLOTS = (
+    _cell(_DIGIT_W), _cell(_DIGIT_W), _cell(_PUNCT_W),   # HH:
+    _cell(_DIGIT_W), _cell(_DIGIT_W), _cell(_PUNCT_W),   # MM:
+    _cell(_DIGIT_W), _cell(_DIGIT_W), _cell(_SPACE_W),   # SS_
+    _word(_SUFFIX_W),                                    # "AM MST"
+)
+
+
+def _scaled_label(parent, scale, color):
+    label = lv.label(parent)
+    label.set_text(" ")  # placeholder -- real content lands via the first _refresh(None)
+    label.set_style_text_color(lv.color_hex(color), 0)
+    # Same pivot+scale enlargement as every other label in this project (see CLAUDE.md).
+    label.set_style_transform_pivot_x(lv.pct(50), 0)
+    label.set_style_transform_pivot_y(lv.pct(50), 0)
+    label.set_style_transform_scale(lv.SCALE_NONE * scale, 0)
+    return label
+
+
+def _make_char_row(parent, slots, scale, color, dy):
+    """Creates one lv.label per slot under `parent`, laid out in a fixed-pitch row and never
+    repositioned again -- only set_text() (via _set_row_text) changes after this. Each
+    label's own CENTER (not its left edge) is pinned at its slot's (dx, dy), computed
+    once here from the slot widths. A character slot's label is auto-fit: LVGL re-applies that
+    alignment automatically whenever a later set_text() changes its size (same mechanism that
+    made the ghost-text bug possible in the first place -- see the comment on
+    screen.invalidate() in _refresh), so each character re-centers within its own fixed slot
+    as its glyph width changes (e.g. '1' vs '8') without ever drifting into a neighboring slot.
+    A word slot's label has a fixed width with left-aligned text, so its box never moves.
+
+    Slot widths are *pre-scale* pixel widths (native 14px-font metrics); align()'s x_ofs/y_ofs
     aren't affected by the label's own transform_scale (scale only enlarges the rendered glyph
     around its pivot, not its position bookkeeping), so the pitch between slot centers has to
     be scaled up here explicitly to keep pace with the enlarged glyphs.
     """
-    total_w = scale * sum(slot_widths)
+    total_w = scale * sum(w for w, _ in slots)
     labels = []
     x = 0  # running left edge, in on-screen (post-scale) pixels
-    for w in slot_widths:
+    for w, is_word in slots:
         visual_w = w * scale
         center_x = x + visual_w // 2 - total_w // 2
-        label = lv.label(parent)
-        label.set_text(" ")  # placeholder -- real content lands via the first _refresh(None)
-        label.set_style_text_color(lv.color_hex(color), 0)
-        # Same pivot+scale enlargement as every other label in this project (see CLAUDE.md) --
-        # applied per character here instead of once per whole string.
-        label.set_style_transform_pivot_x(lv.pct(50), 0)
-        label.set_style_transform_pivot_y(lv.pct(50), 0)
-        label.set_style_transform_scale(lv.SCALE_NONE * scale, 0)
+        label = _scaled_label(parent, scale, color)
+        if is_word:
+            label.set_width(w)
+            label.set_style_text_align(lv.TEXT_ALIGN.LEFT, 0)
         label.align(lv.ALIGN.CENTER, center_x, dy)
         labels.append(label)
         x += visual_w
     return labels
 
 
-def _set_row_text(labels, text):
-    """Applies `text` to a fixed-width character row, one lv.label per character. Callers are
-    expected to pre-format `text` to exactly len(labels) characters (e.g. "%2d" for day-of-month,
-    which is otherwise 1 or 2 digits depending on the date) -- every field in both format
-    strings below is fixed-width for this reason, so this never has to guess how to pad.
-    Defensively right-pads/truncates anyway so a mismatched length degrades instead of raising.
-    MicroPython's str has no .ljust()/.rjust() (CPython-only), hence the manual padding.
-    """
+def _set_row_text(labels, tokens):
+    """Applies `tokens` (one string per slot: a single character, or a whole word for a word
+    slot) to a row made by _make_char_row. Defensively pads/truncates so a mismatched count
+    degrades instead of raising."""
+    tokens = list(tokens)
     n = len(labels)
-    if len(text) < n:
-        text = text + " " * (n - len(text))
-    elif len(text) > n:
-        text = text[:n]
-    for label, ch in zip(labels, text):
-        label.set_text(ch)
+    if len(tokens) < n:
+        tokens += [" "] * (n - len(tokens))
+    for label, tok in zip(labels, tokens[:n]):
+        label.set_text(tok)
 
 
-time_chars = _make_char_row(screen, TIME_SLOT_WIDTHS, 3, 0xFFFFFF, -30)
-date_chars = _make_char_row(screen, DATE_SLOT_WIDTHS, 2, 0xAAAAAA, 60)
+time_chars = _make_char_row(screen, TIME_SLOTS, 3, 0xFFFFFF, -30)
+
+# The date only changes at midnight, so a once-a-day re-center is invisible. That makes it a
+# plain centered label with natural spacing (LVGL re-applies the CENTER alignment on resize).
+date_label = _scaled_label(screen, 2, 0xAAAAAA)
+date_label.align(lv.ALIGN.CENTER, 0, 60)
 
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")  # time.localtime() weekday: 0=Mon
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
@@ -250,10 +261,11 @@ def _refresh(_timer):
     year, month, day, hour, minute, second, weekday = local[0:7]
     hour12 = hour % 12 or 12  # 0 (midnight) and 12 (noon) both display as 12, not 0
     am_pm = "AM" if hour < 12 else "PM"
-    _set_row_text(time_chars, "%02d:%02d:%02d %s %s" % (hour12, minute, second, am_pm, abbr))
-    # "%2d" (not "%d") for day -- day-of-month is 1 or 2 digits depending on the date, and this
-    # keeps it a fixed 2-character, right-justified field (" 2" vs "12") matching DATE_SLOT_WIDTHS.
-    _set_row_text(date_chars, "%s, %s %2d %d" % (_WEEKDAYS[weekday], _MONTHS[month - 1], day, year))
+    _set_row_text(
+        time_chars,
+        list("%02d:%02d:%02d " % (hour12, minute, second)) + ["%s %s" % (am_pm, abbr)],
+    )
+    date_label.set_text("%s, %s %d, %d" % (_WEEKDAYS[weekday], _MONTHS[month - 1], day, year))
 
     # Force a full-screen invalidation on every tick rather than trusting LVGL's own per-widget
     # dirty-rect tracking for these labels. Confirmed on hardware: a stale fragment of the very
