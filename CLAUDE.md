@@ -118,6 +118,15 @@ took three separate, stacked fixes — worth knowing about before touching this 
   in `ST77922Landscape` itself. Fixed pragmatically in `ntp_clock.py` with an unconditional
   `screen.invalidate()` every tick rather than root-causing the LVGL interaction further —
   cheap now that a full redraw is ~100ms instead of 60+ seconds.
+- **The staging buffer was being byte-swapped in place** (fixed 2026-11-09, while porting
+  landscape to MicroPythonOS). The bus swaps `tx_color()` data in place (see "Combining audio"
+  below), and `_flush_cb` used to send straight from the persistent staging buffer. Every area
+  that wasn't redrawn before the next send then went out swapped twice, so its colors flipped
+  between redraws. `ntp_clock.py` hid this by redrawing the whole screen every tick. This is the
+  likely cause of `touch_keyboard_demo_landscape.py`'s unexplained "green flash". `_flush_cb`
+  now copies each band into `frame_buffer1` first (LVGL is done with it by the last flush, and
+  a third `allocate_framebuffer()` fails because the bus only tracks two). It also sends only the
+  physical rows the redraw touched, instead of all 480.
 
 ### Write windows must be 8-pixel column aligned (`ST77922._round_area_cb`)
 

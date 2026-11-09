@@ -381,10 +381,37 @@ class ST77922Landscape(ST77922):
         except MemoryError:
             self._landscape_fb = data_bus.allocate_framebuffer(fb_size, lcd_bus.MEMORY_SPIRAM)
 
+        # Each band is copied into a separate buffer before it's sent. The bus byte-swaps
+        # tx_color() data IN PLACE (lcd_types.c, rgb565_byte_swap), so sending straight from
+        # _landscape_fb left every band it sent byte-swapped in the staging buffer. Any area
+        # that wasn't redrawn before the next send then went out swapped twice, and its
+        # colors flipped back and forth between redraws. ntp_clock.py hid this by redrawing
+        # the whole screen every tick; widgets that only redraw part of the screen (the
+        # touch_keyboard_demo_landscape.py "green flash", and MicroPythonOS) showed it.
+        # Copying first keeps _landscape_fb in native byte order.
+        #
+        # The copy goes into LVGL's own draw buffer (frame_buffer1). A third
+        # allocate_framebuffer() call fails ("allocation flags must be the same for both
+        # buffers": the bus only tracks two), and by the last flush of a redraw LVGL is
+        # done with that buffer and won't draw into it again until flush_ready().
+        self._send_buf = self._frame_buffer1
+        self._send_rows = min(
+            self._SEND_CHUNK_ROWS, len(self._send_buf) // (self._PHYSICAL_WIDTH * 2)
+        )
+
+        # Logical x range touched by the current redraw (logical x maps to physical rows), so
+        # the last flush only sends the rows that changed instead of all 480.
+        self._dirty_lx1 = self._PHYSICAL_HEIGHT
+        self._dirty_lx2 = -1
+
     def _flush_cb(self, _, area, color_p):
         lx1, ly1, lx2, ly2 = area.x1, area.y1, area.x2, area.y2
         w_l = lx2 - lx1 + 1  # logical chunk width (columns)
         h_l = ly2 - ly1 + 1  # logical chunk height (rows)
+        if lx1 < self._dirty_lx1:
+            self._dirty_lx1 = lx1
+        if lx2 > self._dirty_lx2:
+            self._dirty_lx2 = lx2
 
         px_size = lv.color_format_get_size(self._color_space)  # NOQA -- 2 for RGB565
         size = w_l * h_l * px_size
@@ -436,17 +463,31 @@ class ST77922Landscape(ST77922):
         # synchronous busy-wait behavior (see modlcd_bus.c's mp_lcd_bus_tx_color) for this
         # internal loop, so each band's transfer completes before the next begins, without
         # spuriously re-triggering _flush_ready_cb/flush_ready() once per internal band.
+        #
+        # Only the physical rows this redraw touched are sent: logical x range
+        # [_dirty_lx1, _dirty_lx2] is physical rows [479 - _dirty_lx2, 479 - _dirty_lx1]. Rows
+        # are always sent full width (0..319), so every window stays 8-pixel column aligned.
+        # Each band goes through _send_buf; see __init__ for why.
         fb_mv = memoryview(self._landscape_fb)
+        send_mv = memoryview(self._send_buf)
         row_bytes = self._PHYSICAL_WIDTH * 2
+        y = self._PHYSICAL_HEIGHT - 1 - self._dirty_lx2
+        y_end = self._PHYSICAL_HEIGHT - 1 - self._dirty_lx1
+        if y < 0:
+            y = 0
+        if y_end > self._PHYSICAL_HEIGHT - 1:
+            y_end = self._PHYSICAL_HEIGHT - 1
+        self._dirty_lx1 = self._PHYSICAL_HEIGHT
+        self._dirty_lx2 = -1
         self._data_bus.register_callback(None)
         try:
-            y = 0
-            while y < self._PHYSICAL_HEIGHT:
-                y2 = min(y + self._SEND_CHUNK_ROWS, self._PHYSICAL_HEIGHT) - 1
-                is_last_band = y2 == self._PHYSICAL_HEIGHT - 1
+            while y <= y_end:
+                y2 = min(y + self._send_rows - 1, y_end)
+                is_last_band = y2 == y_end
+                n = (y2 - y + 1) * row_bytes
+                send_mv[:n] = fb_mv[y * row_bytes:y * row_bytes + n]
                 cmd = self._set_memory_location(0, y, self._PHYSICAL_WIDTH - 1, y2)
-                band = fb_mv[y * row_bytes:(y2 + 1) * row_bytes]
-                self._data_bus.tx_color(cmd, band, 0, y, self._PHYSICAL_WIDTH - 1, y2,
+                self._data_bus.tx_color(cmd, send_mv[:n], 0, y, self._PHYSICAL_WIDTH - 1, y2,
                                          self._rotation, is_last_band)
                 y = y2 + 1
         finally:
