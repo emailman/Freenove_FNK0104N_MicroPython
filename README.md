@@ -4,7 +4,7 @@ MicroPython scripts for the [Freenove FNK0104N](https://store.freenove.com/produ
 — an ESP32-S3 board with an onboard 3.5" 320x480 QSPI display (ST77922) that has an
 integrated I2C capacitive touch controller.
 
-Freenove only publish an Arduino/C++ tutorial for this board's display and touch. Everything
+Freenove only publishes an Arduino/C++ tutorial for this board's display and touch. Everything
 display- or touch-related in this repo is a from-scratch MicroPython port of their C++
 source (see `st77922.py` and `st77922_touch.py` for exactly which Freenove files each one is
 ported from), running on the community
@@ -90,6 +90,22 @@ the touch controller (pulled from Freenove's GitHub repo's `Datasheet/` folder),
 as `Datasheet/ST77922_TDDI_Interface_Protocol_V01.00.pdf` but **not committed to this repo**
 — it's marked confidential by Sitronix, so `.gitignore` excludes it.
 
+## Installing mpremote
+
+`mpremote` is how files get onto the board and scripts get run. It's a Python package:
+
+1. Install Python 3 from python.org. On Windows, tick **"Add python.exe to PATH"** in the
+   installer.
+2. `pip install mpremote` (or `pipx install mpremote`).
+3. Check it: `mpremote --version`, then `mpremote devs` with the board plugged in. The board
+   shows up as VID:PID `303A:4001`.
+
+The COM port number differs per computer: COM12 in the commands below is just this PC's.
+Windows needs no extra driver (the ESP32-S3's built-in USB uses the standard USB serial
+driver). If the port is busy, close any other serial monitor, Thonny, or IDE console using it.
+If `mpremote` isn't found after installing, Python's Scripts folder isn't on PATH;
+`python -m mpremote ...` works the same.
+
 ## Firmware
 
 Built from a clone of `lvgl_micropython` (WSL Ubuntu), with:
@@ -109,6 +125,71 @@ any same-named module frozen into firmware, so iterating on them is just a matte
 here and re-pushing (e.g. via `mpremote cp <file> :`) — no firmware rebuild needed. A
 rebuild is only required to change something genuinely baked into firmware (board config,
 frozen framework modules, etc).
+
+## Flashing MicroPythonOS
+
+`firmware/mpos_fnk0104n_*.bin` is a single merged image. It goes into the ESP32-S3's internal
+flash at offset `0x0` over USB, not onto an SD card. Use the newest file in `firmware/`.
+
+**Download mode.** The MPOS image uses TinyUSB on the native USB port, so auto-reset doesn't
+work. Hold **BOOT**, tap **RESET**, then let go of BOOT. In download mode the board shows up on
+a different COM port than when it's running (COM11 vs. COM12 on the development PC; check
+Device Manager or `python -m serial.tools.list_ports` on another machine). After flashing,
+press **RESET** if the board doesn't start on its own.
+
+**Erasing.** Erase the whole flash on a new board, or when coming from another firmware
+(plain MicroPython, the `lvgl_micropython` image above). Skip the erase when updating one MPOS
+image to another, so the installed apps and the WiFi settings are kept.
+
+Any of these Windows tools will work:
+
+1. **esptool** (command line; what this project uses):
+
+   ```
+   pip install esptool
+   esptool --chip esp32s3 --port COM11 --baud 460800 --before no-reset --after watchdog-reset write-flash --erase-all 0x0 firmware\mpos_fnk0104n_2026-11-09e_weather.bin
+   ```
+
+   Leave out `--erase-all` to keep the filesystem. Use `--after watchdog-reset`: after a
+   manual download-mode entry, the default `hard-reset` doesn't leave the bootloader.
+2. **ESP Web Flasher** (browser, nothing to install): open
+   <https://espressif.github.io/esptool-js/> in Chrome or Edge (needs Web Serial), click
+   Connect and pick the download-mode port, click "Erase Flash" if needed, add the `.bin` at
+   address `0x0`, then click Program.
+3. **Espressif Flash Download Tool** (Windows GUI): choose chip **ESP32-S3** and mode
+   **Develop**, add the `.bin` at `0x0`, set SPI mode DIO and flash size 8MB, click ERASE if
+   needed, then START.
+4. **Thonny**: Tools → Options → Interpreter → "Install or update MicroPython (esptool)",
+   then pick the local `.bin`. It runs esptool underneath, with fewer options.
+
+After a full erase: connect WiFi again in Settings, reinstall the apps (see below), and enter
+a zip code in Weather Zip. Until then the top bar shows `--°F`.
+
+## MicroPythonOS apps
+
+`mpos_apps/` holds apps for the MicroPythonOS image (`firmware/mpos_fnk0104n_*.bin`, runs on
+COM12). Each app is a folder named after its `fullname` with a `MANIFEST.JSON` (name,
+entrypoint, Activity class name, launcher intent filter), the entrypoint `.py` (an
+`mpos.Activity` subclass), and `icon_64x64.png`. `com.eric.template` is a minimal starting
+point: a button, a tap counter, and a timer that only runs while the app is in the foreground
+(created in `onResume`, deleted in `onPause`).
+
+`com.eric.weatherzip` (Weather Zip) sets the US zip code for the top bar's outside
+temperature. It looks the zip up on zippopotam.us and saves the zip, latitude, longitude and
+place name in the `com.eric.weatherzip` preferences. The top bar module
+(`fnk0104n_topbar.py`, part of the MicroPythonOS firmware build) reads them and fetches the
+temperature from open-meteo.com every 15 minutes. Neither service needs an API key.
+
+Install or update an app with Windows `mpremote` (wait until MPOS has finished booting):
+
+```
+mpremote connect COM12 fs mkdir :/apps          # only once; errors if it exists
+mpremote connect COM12 fs cp -r mpos_apps/com.eric.template :/apps/
+mpremote connect COM12 reset
+```
+
+Don't run MPOS's `install.sh` with no arguments: it copies `lib/` and `builtin/` over the
+frozen copies.
 
 ## Known limitations
 
