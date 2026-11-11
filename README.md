@@ -19,7 +19,9 @@ stock MicroPython.
 - Display: ST77922, 320x480, QSPI, portrait native orientation
 - Touch: integrated capacitive controller on the display panel, but wired as its own,
   separate I2C peripheral (not exposed through the display's QSPI commands)
-- Onboard extras: WS2812 (NeoPixel) RGB LED on GPIO 40, plain LED on GPIO 45
+- Onboard extras: WS2812 (NeoPixel) RGB LED on GPIO 40. There is no plain onboard LED:
+  GPIO 45 only goes to the "Extended IO" header (P3), so `led_blink.py` needs an external LED
+  (see **External LED on GPIO 45** below)
 - SD card (microSD, SDMMC 4-bit) and an ES8311 audio codec + speaker amp, for `music_player.py`
 
 ### Pin reference
@@ -34,7 +36,7 @@ stock MicroPython.
 | Audio: ES8311 control (I2C, addr `0x18`)* | `SCL=39 SDA=38` (shares the touch controller's bus) |
 | Audio: speaker amp enable* | `GPIO 1` (active-LOW -- confirmed on hardware; docs.freenove.com didn't document polarity) |
 | Onboard RGB LED (WS2812) | `GPIO 40` |
-| Onboard LED | `GPIO 45` |
+| Extended IO header (P3) | `1=3V3 2=GND 3=GPIO46 4=GPIO45` -- no onboard LED; wire an external one to GPIO 45 for `led_blink.py` |
 
 \* SD card and audio pins are FNK0104N-specific values sourced from docs.freenove.com (see
 `music_player.py`'s docstring for the exact chapter URLs) rather than from a Freenove source
@@ -57,6 +59,10 @@ on stock MicroPython too.
 | `hello_world_display.py` | Main display/touch demo. Shows a red-top/blue-bottom split screen; tapping either half toggles it between red and blue. |
 | `touch_led_colors.py` | Divides the screen into 5 touch areas (red/green/blue/white/black); tapping one sets the onboard RGB LED to that color. |
 | `touch_keyboard_demo.py` | On-screen touch keyboard (LVGL's built-in `lv.keyboard`/`lv.textarea`) in portrait. Confirms both widgets are compiled into this firmware. |
+| `swipe_demo.py` | Swipe gesture test in portrait, using LVGL's built-in `lv.EVENT.GESTURE` / `get_gesture_dir()`. Shows the direction, changes color per direction and counts swipes. The screen's `SCROLLABLE` flag is removed, otherwise drags become scrolls and no gesture fires. |
+| `swipe_demo_landscape.py` | Landscape version of `swipe_demo.py`, pairing `st77922.ST77922Landscape` with `st77922_touch.ST77922LTouch` so swipe directions match the landscape screen. |
+| `seasons_fade.py` | Landscape slideshow of the pictures in `pictures/seasons`, fading each one in from black and back out. Swipe left/right to change picture. Draws the fade itself (viper) instead of through LVGL, which is too slow for full-screen fades; ~11 fps. Needs the pictures converted with `jpg_to_rgb565.py` and copied to `/seasons` on the board (see its docstring). |
+| `seasons_fade_rtl.py` | Variant of `seasons_fade.py` where a soft-edged fade sweeps from right to left (fade-in reveals from the right edge; fade-out darkens from the right, the left edge fading last). Only rows that changed are sent, so it runs at ~30 fps. Uses the same `/seasons` pictures. |
 | `touch_keyboard_demo_landscape.py` | Landscape version of `touch_keyboard_demo.py`, pairing `st77922.ST77922Landscape` with `st77922_touch.ST77922LTouch` (remaps raw physical touch coordinates into the landscape logical canvas). Known cosmetic issue: some keyboard control buttons (Enter, mode-switch, sometimes Backspace) briefly flash solid green -- see its docstring. |
 | `ntp_clock.py` | WiFi + NTP-synced clock, rendered in landscape via `st77922.ST77922Landscape`. Shows Mountain Time (auto MST/MDT). Needs a real `wifi_secrets.py` (see below). |
 | `wifi_secrets.py.example` | Template for `wifi_secrets.py` (gitignored) -- copy and fill in real WiFi `SSID`/`PASSWORD` before running `ntp_clock.py` or `voice_recorder.py` (the recorder still works without it, but names files `recNNN.wav`). |
@@ -69,12 +75,15 @@ on stock MicroPython too.
 | `es8311.py` | I2C driver for the ES8311 audio codec, ported from raptor09010's `Micropython-ES8311-Library`. Playback, plus mic/ADC input via `enable_mic()`. Used by `music_player.py`, `voice_recorder.py`, `sound_meter.py`, `spectrum_analyzer.py` and `rainbow_fade.py`. |
 | `wavplayer.py` | Non-blocking WAV-over-I2S player, from Mike Teachman's `micropython-i2s-examples` (via the same ES8311 library repo above). |
 | `mp3_to_wav.py` | **PC-side tool**, not a board script. Converts an MP3 to a 16-bit PCM WAV (this firmware has no MP3 decoder) using `miniaudio`; run with the project's `.venv`. |
+| `jpg_to_rgb565.py` | **PC-side tool**, not a board script. Converts images to raw RGB565 files scaled to 480x320 and pre-rotated for landscape, for `seasons_fade.py`. Uses Pillow; run with the project's `.venv`. |
 | `demo1.mp3` / `demo1.wav` | Sample track. The `.wav` (produced by `mp3_to_wav.py`) is what actually gets copied to the SD card and played. |
 | `screenshot.jpg` | Photo of `hello_world_display.py` running on the board. |
 | `st77922.py` / `_st77922_init.py` | ST77922 QSPI display driver, ported from Freenove's `ST77922.h`/`.cpp`. `_st77922_init.py` holds the panel init command table. Also has `ST77922Landscape`, a from-scratch software-rotation variant used by `ntp_clock.py` (see its docstring). |
 | `_st77922landscape_init.py` | Thin re-export of `_st77922_init.py`'s init table, required only because `display_driver_framework.DisplayDriver.init()` picks up the init module by class name (`ST77922Landscape` needs its own `_st77922landscape_init` module to be found at all) -- the actual init sequence is identical to `ST77922`'s. |
 | `st77922_touch.py` | I2C driver for the display's integrated touch controller, ported from Freenove's `ST77922_Touch.h`/`.cpp`. Also has `ST77922LTouch`, which remaps raw touch coordinates for use with `st77922.ST77922Landscape` (used by `touch_keyboard_demo_landscape.py`). |
-| `led_blink.py` | Blinks the plain onboard LED (GPIO 45). No firmware/display dependency. |
+| `bme280.py` | I2C driver for a Bosch BME280 temperature/humidity/pressure sensor on the "I2C" header (P4: 1=3V3 2=GND 3=SCL/GPIO39 4=SDA/GPIO38; CSB to 3V3, SDO to GND for address 0x76). `read()` returns degC/hPa/%RH, `read_f()` degF/inHg/%RH. Uses Bosch's integer compensation code. Works with `machine.I2C` or the touch driver's shared `i2c.I2C.Bus`. Confirmed working on hardware. |
+| `bme280_display.py` | Shows the BME280's readings on the display (portrait), refreshed every 2s: temperature in °F (with °C and the session's low/high), relative humidity, and pressure in inHg/hPa. Set `ALTITUDE_M` to show sea-level pressure instead of station pressure. Needs `bme280.py`. Touch isn't used. |
+| `led_blink.py` | Blinks an **external** LED on GPIO 45 (the board has no plain onboard LED; see **External LED on GPIO 45**). No firmware/display dependency. |
 | `rgb_led_blink_fnk0104n.py` | Cycles the onboard WS2812 RGB LED (GPIO 40) through red/green/blue. No firmware/display dependency. |
 | `firmware/lvgl_micropy_ESP32_GENERIC_S3-SPIRAM_OCT-8.bin` | The custom-built firmware binary (see below). |
 
@@ -84,6 +93,22 @@ from the REPL (`import hello_world_display`, etc.).
 `music_player.py` also needs `demo1.wav` copied to the root of a microSD card inserted in the
 board (fastest via a card reader, not WebREPL/serial — it's ~4.7MB), and `es8311.py` /
 `wavplayer.py` pushed alongside it like any other loose file.
+
+### External LED on GPIO 45
+
+Freenove's 3.5" schematic (`Schematic/3.5inch_ESP32-S3_Display_Schematic.pdf` in
+[Freenove_ESP32_S3_Display](https://github.com/Freenove/Freenove_ESP32_S3_Display)) has no
+LED on GPIO 45. The pin only goes to pin 4 of the 4-pin "Extended IO" header (P3). To run
+`led_blink.py`, wire an LED there:
+
+```
+P3 pin 4 (GPIO 45) ──[ 220–330Ω ]──►|── P3 pin 2 (GND)
+                                  LED (anode → resistor, cathode → GND)
+```
+
+Wire the LED to GND as shown (active-high), not to 3V3. GPIO 45 is an ESP32-S3 strapping
+pin that sets the flash voltage at reset. It has to be low at boot, and an LED wired to 3V3
+could pull it high and stop the board from booting.
 
 `st77922_touch.py` was also verified against Sitronix's own register-level protocol spec for
 the touch controller (pulled from Freenove's GitHub repo's `Datasheet/` folder), kept locally
