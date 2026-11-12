@@ -366,6 +366,34 @@ things surfaced on hardware that apply to any future combined script (e.g. a mus
   `os.stat()` afterwards, reports "Save failed" if the size is wrong, and the picker offers the
   RAM copy as "(unsaved) last recording".
 
+## HTTPS on the board (`flight_tracker.py`)
+
+- **MicroPython's `requests` sends HTTP/1.0, and some servers refuse it.** adsb.lol answers
+  every HTTP/1.0 request with `426 Upgrade Required` (confirmed with curl's `--http1.0` too).
+  `flight_tracker.py` has its own small `http_get()` instead: a socket wrapped with
+  `ssl.wrap_socket(..., server_hostname=host)`, an HTTP/1.1 request with `Connection: close`,
+  and a body read by `content-length` (with chunked decoding as a fallback). Copy it for any
+  other API that rejects `requests`.
+- **One HTTPS request takes 2.5-11 s here**, mostly the TLS handshake and network waits. Doing
+  it in an LVGL timer freezes touch and drawing for that long. `flight_tracker.py` runs it on a
+  `_thread` instead (`_thread.stack_size(32 * 1024)` first, since TLS needs more than the
+  default stack). The thread does only network and JSON work, and hands a result tuple to the
+  LVGL timer, which does all the drawing, since LVGL isn't thread-safe. UI stalls fell to
+  ~0.4 s (~1 s when parsing a ~200 KB response).
+- **airplanes.live** (the same `/v2/point` API as adsb.lol) now refuses unregistered clients
+  and asks for an email to its operators. adsb.lol needs no key.
+
+## Don't keep printing after `mpremote run` exits
+
+Once `mpremote run` (or `exec`) returns, nothing reads the board's USB serial output, but
+timers and threads started by the script keep running. A script that keeps calling `print()`
+(e.g. a log line every update) eventually fills the serial output buffer, and the next
+`print()` blocks forever. The whole app freezes and mpremote can't get back in
+(`could not enter raw repl`) until a physical RESET. Seen with `flight_tracker.py`
+(2026-11-12): it froze when started detached, but ran fine for minutes while a logger was
+attached, and ran indefinitely once its per-update prints were gated behind `DEBUG = False`.
+Printing at startup is fine. Repeated output belongs behind a debug flag, or on screen.
+
 ## LVGL Python binding quirks
 
 This binding (generated for this specific firmware build) doesn't always put enums where

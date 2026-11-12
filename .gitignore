@@ -11,3 +11,6 @@ __pycache__/
 
 # Converted pictures from jpg_to_rgb565.py -- regenerate from the JPEGs.
 /pictures/seasons/rgb565/
+
+# Airport table for flight_tracker.py -- regenerate with make_airports.py.
+/airports.txt
