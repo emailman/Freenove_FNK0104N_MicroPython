@@ -298,6 +298,12 @@ things surfaced on hardware that apply to any future combined script (e.g. a mus
   as purple). That swap happens **in place in your buffer**, so never send the same buffer
   twice without redrawing it: `rainbow_fade.py` filled one 40-row band and sent it 12 times,
   and every other band on screen came out byte-swapped (2026-11-02).
+  `tx_color()` also sends **the whole buffer it is given**, whatever the window size. To send
+  fewer rows than the buffer holds, pass `memoryview(buf)[:rows * 640]`, as
+  `ST77922Landscape._flush_cb` and `galton_board.py` do. Measured on hardware (2026-11-16): a
+  1-row send cost 2.9ms when given the full 40-row buffer, and 0.7ms when given a 1-row slice.
+  The extra rows should also wrap around inside the window and overwrite it with stale data
+  from the end of the buffer (inferred from how RAMWR windows work, not seen on screen).
 - **Long synchronous panel writes starve I2S output, even with CPU to spare** (measured
   2026-11-02 for `rainbow_fade.py`). Painting the full screen in one go (12 synchronous 40-row
   `tx_color()` bands, ~39ms of busy-waiting) let a generated tone's TX callbacks fall from the
