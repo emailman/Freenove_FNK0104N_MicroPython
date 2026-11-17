@@ -58,75 +58,16 @@ required for correctness on real hardware (not stylistic choices):
 Hardware MADCTL rotation doesn't behave correctly on this panel (Freenove's own C++ code works
 around this with a manual software pixel-shuffle in `Fill_Colors()` for landscape, rotations
 1/3). `ST77922Landscape` (used by `ntp_clock.py`) is this project's own from-scratch port of
-that same idea — see the next section for the real hardware issues that surfaced building it
-and how they were fixed.
+that same idea — see "Landscape support" below and the `fnk0104n-landscape` skill.
 
-## Landscape support (`ST77922Landscape`) — a real panel limitation, not a software bug
+## Landscape support (`ST77922Landscape`)
 
-`ST77922Landscape` presents LVGL a logical 480x320 canvas and remaps every flush by hand onto
-the physical, still-portrait-native 320x480 panel (MADCTL is never touched — see its class
-docstring for why neither hardware rotation nor LVGL's own software-rotation path
-(`LV_DRAW_TRANSFORM_USE_MATRIX=0`) are usable here). Getting this working on real hardware
-took three separate, stacked fixes — worth knowing about before touching this class again:
-
-- **The naive per-chunk rotation loop was catastrophically slow: ~8 seconds per chunk**,
-  measured directly on hardware (not estimated) — a plain-Python loop doing a 2-byte
-  `memoryview` slice-copy per pixel, ~12,480 iterations for one 480x26 chunk. A full-screen
-  redraw (13+ chunks) took well over a minute, and `ntp_clock.py`'s once-a-second refresh timer
-  was re-running that cost every second, forever — also the real explanation for a separately
-  -observed "REPL becomes fully unresponsive" symptom. **Fixed with `@micropython.viper`**
-  (confirmed this firmware build supports both `@micropython.viper` and `@micropython.native`
-  — tested directly on hardware, not assumed): rewriting the same index arithmetic as a
-  `ptr16`-typed pointer-indexing viper function instead of `memoryview` slice objects measured
-  **~2200x faster (3.6ms vs. 8.0s for the same chunk)**, confirmed byte-identical output
-  against the old loop. See `_rotate_chunk_rgb565` in `st77922.py`. (Also confirmed on hardware
-  while chasing this: MicroPython's `array`/`bytearray`/`memoryview` here only support
-  `step=1` slicing — no vectorized strided-copy trick was ever on the table.)
-- **This specific ST77922 panel cannot handle a narrow-CASET/full-RASET window write, under
-  any tested condition** — this is the real explanation for what looked like generic visual
-  "corruption" (green background instead of black, garbled text) for a long stretch of this
-  feature's development. Isolated via a series of throwaway hardware-only diagnostic scripts
-  that stripped away LVGL, rotation math, and Python entirely: a *single*, isolated, all-black
-  narrow-CASET(≤`BUFFER_ROWS`px)/full-RASET(0-479) write — the very first QSPI content write
-  after `display.init()`, nothing sent before it — renders green with random noise instead of
-  black. Repeating it, synchronizing every write so each DMA transfer completes before the
-  next begins, and substituting RAMWR for RAMWRC all made no difference — still green. A
-  full-CASET/narrow-RASET write (portrait mode's shape) of the identical color is always clean.
-  This rules out rotation math, buffer lifetime, timing/races, and command semantics — it's
-  this specific window shape, full stop, that the panel's controller cannot handle, for reasons
-  no amount of software-level testing without a logic analyzer could pin down further.
-  Landscape's row-based LVGL chunking combined with a 90-degree rotation architecturally forces
-  exactly this window shape for any naive per-chunk send (chunked logical rows always span the
-  full logical width, which becomes the full physical Y range after rotation, while the
-  chunked logical dimension becomes the narrow physical X range) — so the fix works around it
-  rather than solving it: `_flush_cb` now blits each chunk's rotated pixels into a persistent,
-  full-panel-sized (320x480x2 byte, PSRAM+DMA) staging framebuffer instead of sending anything
-  to hardware, and only on `flush_is_last()` does it write to the panel for real — by
-  re-slicing the *complete* accumulated image into 40-row, full-CASET/narrow-RASET bands
-  (matching portrait mode's own proven-safe chunk size exactly) and sending those,
-  synchronously. Never send a narrow-CASET/full-RASET window to this panel again.
-  **Refined 2026-10-30 (see "Write windows must be 8-pixel column aligned" below):** the real
-  rule appears to be column alignment, not narrowness or height. Landscape's narrow windows
-  were chunk-height wide (e.g. 26px), which is not a multiple of 8. That would explain the
-  failure, but landscape itself hasn't been re-tested with aligned windows.
-- **A stale-text "ghosting" bug**, found only after the two fixes above (a full redraw is fast
-  enough now that this could actually be observed cleanly): `ntp_clock.py`'s per-second
-  `set_text()` on a `transform_scale`-enlarged label only invalidates that label's *current*
-  box, never the union with wherever an earlier, differently-sized/positioned render happened
-  to sit — so a stale fragment of the very first render stayed on screen indefinitely. Likely
-  an LVGL invalidation-vs-`transform_scale` interaction (see "Text sizing" below), not anything
-  in `ST77922Landscape` itself. Fixed pragmatically in `ntp_clock.py` with an unconditional
-  `screen.invalidate()` every tick rather than root-causing the LVGL interaction further —
-  cheap now that a full redraw is ~100ms instead of 60+ seconds.
-- **The staging buffer was being byte-swapped in place** (fixed 2026-11-09, while porting
-  landscape to MicroPythonOS). The bus swaps `tx_color()` data in place (see "Combining audio"
-  below), and `_flush_cb` used to send straight from the persistent staging buffer. Every area
-  that wasn't redrawn before the next send then went out swapped twice, so its colors flipped
-  between redraws. `ntp_clock.py` hid this by redrawing the whole screen every tick. This is the
-  likely cause of `touch_keyboard_demo_landscape.py`'s unexplained "green flash". `_flush_cb`
-  now copies each band into `frame_buffer1` first (LVGL is done with it by the last flush, and
-  a third `allocate_framebuffer()` fails because the bus only tracks two). It also sends only the
-  physical rows the redraw touched, instead of all 480.
+`ST77922Landscape` presents LVGL a logical 480x320 canvas and remaps every flush by hand onto the
+physical portrait panel. **Never send a narrow-CASET/full-RASET window to this panel** (it
+renders green noise; see the column-alignment rule below). The full history of the three
+stacked landscape fixes (viper rotation, the full-panel staging buffer, ghosting, in-place byte
+swap) is in the `fnk0104n-landscape` skill: load it before touching `ST77922Landscape` or any
+landscape script.
 
 ### Write windows must be 8-pixel column aligned (`ST77922._round_area_cb`)
 
@@ -184,95 +125,13 @@ is `RstChip` ("notifies host that the touch controller should be reset") — `_g
 calls `hw_reset()` when it sees this set, which the original Freenove C++ source doesn't
 handle either.
 
-## `machine.SDCard` has a non-standard, project-specific constructor
-
-Don't trust upstream MicroPython's `machine.SDCard` docs, or the file at
-`lib/micropython/ports/esp32/machine_sdcard.c` in the WSL `lvgl_micropython` clone, for this
-project's firmware — **`lvgl_micropython`'s build overlays its own replacement file,
-`micropy_updates/esp32/machine_sdcard.c`, on top of the upstream one**, and that overlay has a
-different constructor signature. This cost real debugging time (`music_player.py`'s SD/MMC
-mount call, working from the upstream file's kwargs, failed twice with different errors before
-the overlay file turned up — `micropy_updates/` also holds a similarly-overlaid
-`machine_hw_spi.c`, worth checking first for the same reason if `machine.SPI`/`SPI.Bus`
-behavior ever looks off from upstream docs too).
-
-The overlay's SD/MMC-mode (`slot=0/1`) kwargs, confirmed by reading that file directly: `slot`,
-`width`, `clk` (**not** `sck`), `cmd`, `data_pins` (**not** `data`) — all plain ints, with
-`data_pins` a tuple of ints (`mp_obj_get_int()` directly, not `machine_pin_get_id()`, so
-`machine.Pin` objects don't work here — pass raw GPIO numbers). `cd`/`wp` also exist as ints
-(`-1` = unused). SPI mode (`spi_bus=` + `cs=`) takes an already-constructed `SPI.Bus` object
-(this project's own custom SPI class, same one `hello_world_display.py` uses for the display's
-QSPI bus) rather than raw `sck`/`mosi`/`miso` pins like upstream's SPI-mode `machine.SDCard`
-does. `machine.I2C`/`machine.I2S` are **not** overlaid — those remain the unmodified upstream
-implementations (which accept either a `Pin` object or a raw int for pin arguments).
-
-## `machine.I2S` has no MCLK (`mck=`) support on this firmware — and the PWM workaround for it didn't hold up
-
-Confirmed by reading `lib/micropython/ports/esp32/machine_i2s.c` in the WSL `lvgl_micropython`
-clone directly (not overlaid — see above — this is genuinely the file this firmware is built
-from): it only recognizes `sck`/`ws`/`sd`, no `mck`. Easy to get backwards, because MicroPython
-*does* have `mck=` support for `machine.I2S` — just not on the ESP32 port specifically. Other
-ports (rp2, stm32, mimxrt) share a generic `extmod/machine_i2s.c` that has it;
-`mpconfigport.h`'s `MICROPY_PY_MACHINE_I2S_INCLUDEFILE` points the ESP32 port at its own
-`ports/esp32/machine_i2s.c` instead, which predates/lacks that addition.
-
-The first fix tried was generating the ES8311's MCLK in software via `machine.PWM`
-(`freq=sample_rate*256`), matching what the community driver `es8311.py` was ported from does
-on boards with the same limitation. **This did not work reliably on hardware**: real audio
-played for a few seconds, then permanently cut out with zero software-visible error —
-confirmed (by wrapping the WAV player's I2S IRQ callback with a counter) that the SD-card
-reads and I2S non-blocking writes kept running correctly and continuously the entire time, so
-the failure was downstream of all of that, consistent with the codec's PLL briefly locking
-onto the synthesized clock and then losing lock.
-
-**Fix confirmed on hardware (2026-09-08): don't use MCLK at all.** The ES8311 has a documented alternate mode where it
-derives its internal clock from BCLK (the I2S bit clock — a real, ESP32-hardware-generated
-clock, not synthesized) instead of a dedicated MCLK line — register `0x01` bit 7 (`MCLK_SEL`:
-0 = MCLK pin, 1 = BCLK). Confirmed against Espressif's own official driver
-(`espressif/esp-bsp`, `components/es8311/es8311.c`, fetched directly rather than trusting a
-paraphrase) for the exact clock-coefficient math. For this project's fixed case
-(44100Hz/16-bit, what `mp3_to_wav.py` produces), that driver's `coeff_div[]` table turned up a
-convenient fact: BCLK-source mode and the old 256×-ratio MCLK-pin mode need *identical*
-clock-manager register values (0x03–0x08) at 44100Hz — only two registers actually differ:
-`0x01` (`0x3F`→`0xBF`, the mode-select bit above) and `0x02` (`0x00`→`0x18`, a pre-multiplier
-compensating for BCLK being 1/8th the frequency the old table assumed). See `es8311.py` for
-the corrected table and full writeup. This eliminates the PWM/MCLK pin entirely — GPIO17
-(Freenove's documented `I2S_MCK` pin) goes unused by this driver as a result.
-
-One caveat worth remembering if a different sample rate is ever needed: Espressif's
-`coeff_div[]` table only tabulates a handful of specific MCLK/rate pairs, not every possible
-ratio for every rate — BCLK-as-source mode only has a matching table row where `rate × 32`
-happens to be one of those tabulated values (44100Hz's is, luckily). A real multi-rate player
-would need to either look up/recompute the right row per file, or resample everything to
-44100Hz ahead of time (already the plan, via `mp3_to_wav.py`) to sidestep the issue.
-
-Switching to BCLK-as-source made things *worse* at first (total silence, not even the old
-PWM version's brief burst) — because BCLK-as-source means the codec has to lock onto BCLK,
-and `music_player.py`'s `play()` was configuring the codec (`ES8311.power_on()`) **before**
-`WavPlayer.play()` ever created the I2S channel and started BCLK actually toggling. There was
-nothing for the codec to derive a clock from yet. Fixed by reordering `play()`: start I2S
-first (`WavPlayer.play()`), then power on the codec. Obvious in hindsight, but easy to get
-backwards when porting code that assumed an always-present external MCLK, which doesn't have
-this ordering dependency the same way.
-
-With the clock/sequencing fixes above all correctly applied, playback was *still* silent —
-because a separate, unrelated bug was stacked on top of all of it: `music_player.py`'s speaker
-amp enable pin (GPIO1) was being driven the wrong polarity. docs.freenove.com never documented
-which level enables the amp, so it was guessed active-high; on-hardware testing (isolating the
-amp-enable pin with a synthetic tone generated directly over I2S, bypassing SD/WAV entirely,
-so the codec's byte-perfect I2C register writes and healthy I2S pipeline could be trusted and
-GPIO1 treated as the only remaining variable) showed it's actually active-LOW. This alone was
-enough to fully explain an earlier round of "codec config verified byte-perfect, I2S pipeline
-verified healthy, still total silence" debugging that had otherwise pointed toward a downstream
-amp hardware fault — the amp was simply being told to stay off the whole time. Worth
-remembering if silent/no-output symptoms come up again here: don't assume a hardware fault
-before double-checking enable-pin polarity assumptions sourced from docs.freenove.com, since at
-least one of them (this one) was wrong.
-
 ## Combining audio with the display/touch stack (`voice_recorder.py`)
 
 `voice_recorder.py` is the first script to run audio and LVGL/touch in one process. These
 things surfaced on hardware that apply to any future combined script (e.g. a music player UI):
+
+Audio-only gotchas (codec, I2S, mic, SD card, WiFi with the mic) are in the `fnk0104n-audio`
+skill: load it before writing or debugging any audio code.
 
 - **Render cost decides whether audio keeps up** (measured for `sound_meter.py`, 2026-10-30,
   by timing `lv.task_handler()` with each widget alone, at a 10 Hz UI rate). Continuous I2S RX
@@ -308,69 +167,9 @@ things surfaced on hardware that apply to any future combined script (e.g. a mus
   2026-11-02 for `rainbow_fade.py`). Painting the full screen in one go (12 synchronous 40-row
   `tx_color()` bands, ~39ms of busy-waiting) let a generated tone's TX callbacks fall from the
   43/s it needs to 20/s, heard as static. That happened even at 10 repaints/s with ~40% of the
-  CPU idle, and with no stalls, so this isn't the dropped-callback problem described below. The
+  CPU idle, and with no stalls, so this isn't the dropped-callback problem described in the `fnk0104n-audio` skill. The
   hardware was simply running out of audio. 1-4 bands per LVGL tick held a steady 43/s, so
   spread big direct writes across ticks.
-- **One I2C host 0 for both codec and touch.** They share pins 39/38, and host 0 can't be
-  opened twice. Pass the touch driver's `i2c.I2C.Bus` straight to `ES8311(...)` — it wraps
-  `machine.I2C` and has the same `writeto_mem()` the codec driver uses.
-- **Non-blocking I2S callbacks get silently dropped.** `machine.I2S` IRQ callbacks go through
-  `micropython.schedule()`, whose queue is shared with LVGL's task handler and touch polling.
-  When it's full, the completion callback is lost and the transfer chain just stops — no
-  exception (playback stuck at position 0). `voice_recorder.py` needed 5 watchdog restarts
-  across a handful of touch-driven record/play runs, so this is common, not a rare edge case.
-  Its fix: the 100ms LVGL UI timer re-invokes the callback if audio has made no progress for
-  500ms. Also keep LVGL redraws small (no full-screen `invalidate()` every tick) and I2S
-  buffers generous (`ibuf=40000`). Before either of those, a 10s recording took ~40s.
-- **Touch polling puts clicks into the mic.** Every LVGL touch read is I2C traffic on the bus
-  shared with the codec, and it couples into the mic input. Measured on a silent recording: a
-  ~0.5ms click every ~33ms (the indev read period), peaking ~750 raw — only ~9dB below
-  speech, so no noise gate can separate them, and heard as "static" after normalization.
-  With `touch._indev_drv.enable(False)` for the duration of the recording: zero clicks, peak
-  162. `voice_recorder.py` pauses touch while recording for this reason.
-- **Mic path:** `ES8311.enable_mic()`. Note that `_POWER_UP`'s `0x0A=0x4C` mutes the ADC's
-  serial output (bit 6) — fine for playback, and `enable_mic()` clears it. Raw speech at
-  36dB mic gain only peaks at ~2400/32767, so recordings are normalized in software (viper)
-  instead of adding more analog gain.
-- **Post-processing chain** (`_process()`, run once after each recording): one-pole 100Hz
-  high-pass + Butterworth 4kHz low-pass biquad, then a 10ms-window noise gate (-12dB floor,
-  200ms hold, one window of look-ahead, linear gain ramps), then normalization. It's all
-  integer math in `@micropython.viper` (the filter in Q13/Q15 fixed point) — the full
-  441k-sample pass takes ~1s. Two things to know if you edit it: viper functions take at most
-  4 arguments, which is why coefficients are passed as an `array("i")`; and the gate
-  threshold (200 raw) was calibrated against a silent, filtered recording whose 10ms window
-  peaks never exceeded 98. Re-measure if `MIC_GAIN` or the filter cutoffs change. Once touch
-  polling was paused, the gate helped; before that it couldn't have, as explained above.
-- **Processing and saving are deferred to the LVGL timer.** `_rx_cb` only sets a
-  `PROCESSING` state. The UI timer runs `_process()` on the tick *after* "Processing..." has
-  been drawn, then does the same for `SAVING` / `_save()`. Each step blocks for ~1s (processing)
-  or ~2.6s (the SD write of 882KB). Running them directly in the I2S callback would freeze the
-  UI with a stale status line. The SD card is mounted with the same `machine.SDCard` call as
-  `music_player.py` (see the SDCard section above), after display init, and it coexists with
-  the QSPI display and I2S without problems.
-- **WiFi for timestamps, then off.** Recordings are named from one WiFi+NTP sync at startup
-  (`local_time.py`, done after display/touch init like any other late import). Confirmed on
-  hardware that this coexists with the display/touch stack. **WiFi must be shut down with
-  `wlan.disconnect()` before `wlan.active(False)`.** With `active(False)` alone, the mic
-  recorded only its noise floor for the rest of the session: 100ms-window peaks had a median
-  of 91 while someone was talking, versus ~360 with no WiFi at all. Playback was unaffected,
-  which made this look like a playback bug at first (the recordings "played silently"). The
-  cause is unknown; the disconnect-first fix was confirmed on hardware. The first NTP attempt
-  often fails with `OSError(116)` (a timeout) right after connecting, so keep the retries.
-- **Playback streams from SD.** PLAY opens a file picker, and the chosen file is read
-  `CHUNK` bytes at a time inside `_tx_cb`, so the same stall watchdog covers it. Songs don't
-  fit in the 882KB record buffer. Only 44100Hz/16-bit PCM is accepted (`_open_wav()` walks the
-  RIFF chunks). Stereo is fine, because std-mode BCLK is the same for mono and stereo. The
-  picker is deleted with `delete_async()`, since it's closed from an event callback of one of
-  its own children.
-- **SD writes can fail silently.** Seen on hardware (2026-09-26): the card got into a state
-  where every write, even a 5-byte file from a clean boot with nothing else running, returned
-  the full byte count from `write()`, raised nothing on `close()`, and left a 0-byte file.
-  Directory changes (creating and deleting files) still worked, and so did reads. Windows
-  `chkdsk` found no errors, and after the card was re-inserted, writes worked again. The cause
-  is unknown. Don't trust `write()`'s return value for anything important: `_save()` checks
-  `os.stat()` afterwards, reports "Save failed" if the size is wrong, and the picker offers the
-  RAM copy as "(unsaved) last recording".
 
 ## HTTPS on the board (`flight_tracker.py`)
 

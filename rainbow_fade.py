@@ -199,7 +199,7 @@ amp_enable = Pin(AMP_ENABLE_PIN, Pin.OUT, value=1)  # off until the codec is set
 _SINE = array("h", (int(32767 * math.sin(2 * math.pi * i / 1024)) for i in range(1024)))
 _buf = bytearray(CHUNK * 2)
 _osc = array("i", (0, 0, 0))  # phase (32-bit, wraps), phase step per sample, peak amplitude
-_i2s = None
+_i2s = None  # type: I2S | None
 _last_progress = time.ticks_ms()
 _stalls = 0
 
